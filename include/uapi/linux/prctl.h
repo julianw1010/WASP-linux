@@ -363,5 +363,10 @@ struct prctl_mm_map {
 # define PR_TIMER_CREATE_RESTORE_IDS_OFF	0
 # define PR_TIMER_CREATE_RESTORE_IDS_ON		1
 # define PR_TIMER_CREATE_RESTORE_IDS_GET	2
+/* PGD replication control */
+#define PR_SET_PGTABLE_REPL     100
+#define PR_GET_PGTABLE_REPL     101
+#define PR_SET_PGTABLE_REPL_NODE 102 
+#define PR_GET_PGTABLE_REPL_NODE 103
 
 #endif /* _LINUX_PRCTL_H */

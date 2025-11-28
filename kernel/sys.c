@@ -76,8 +76,19 @@
 #include <asm/unistd.h>
 
 #include <trace/events/task.h>
+#include <linux/numa.h>  // ← ADD THIS for MAX_NUMNODES
 
 #include "uid16.h"
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#include <asm/tlbflush.h>
+#include <asm/mmu_context.h>
+#define PR_SET_PGTABLE_REPL     100  /* Enable PGD replication */
+#define PR_GET_PGTABLE_REPL     101  /* Get PGD replication status */
+#define PR_SET_PGTABLE_REPL_NODE 102
+#define PR_GET_PGTABLE_REPL_NODE 103
+#endif
 
 #ifndef SET_UNALIGN_CTL
 # define SET_UNALIGN_CTL(a, b)	(-EINVAL)
@@ -2820,6 +2831,265 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unsigned long, arg3,
 			return -EINVAL;
 		error = posixtimer_create_prctl(arg2);
 		break;
+#ifdef CONFIG_PGTABLE_REPLICATION
+case PR_SET_PGTABLE_REPL:
+	{
+		nodemask_t nodes;
+		struct mm_struct *mm = NULL;
+		struct task_struct *task;
+		int ret;
+		int node;
+		int valid_nodes = 0;
+		/* Limit bitmask checks to size of long to prevent overflow */
+		int max_node = min(MAX_NUMNODES, (int)BITS_PER_LONG);
+		
+		/* Security: Only root/CAP_SYS_NICE can change deep memory topology settings */
+		if (!capable(CAP_SYS_NICE)) {
+			return -EPERM;
+		}
+
+		/* WASP Support: Select Target MM based on arg3 (PID) */
+		if (arg3 != 0) {
+			/* External Control Mode: Modifying another process */
+			rcu_read_lock();
+			task = find_task_by_vpid((pid_t)arg3);
+			if (task)
+				get_task_struct(task);
+			rcu_read_unlock();
+
+			if (!task)
+				return -ESRCH;
+
+			/* get_task_mm increments mm_users, need mmput later */
+			mm = get_task_mm(task);
+			put_task_struct(task);
+		} else {
+			/* Self Control Mode: Modifying current process */
+			/* Safety: Don't allow init (pid 1) to replicate */
+			if (current->pid == 1)
+				return -EINVAL;
+
+			mm = current->mm;
+			if (mm) 
+				mmget(mm); /* Increment ref to match get_task_mm behavior */
+		}
+		
+		if (!mm) {
+			return -EINVAL;
+		}
+		
+		/* --- DISABLE LOGIC (arg2 == 0) --- */
+		if (arg2 == 0) {
+			/* If already disabled, do nothing */
+			if (!mm->repl_pgd_enabled && nodes_empty(mm->repl_pgd_nodes)) {
+				error = 0;
+				goto out_put_mm;
+			}
+			/* Safety check for inconsistent state */
+			if (!mm->repl_pgd_enabled && !nodes_empty(mm->repl_pgd_nodes)) {
+				mutex_lock(&mm->repl_mutex);
+				nodes_clear(mm->repl_pgd_nodes);
+				mutex_unlock(&mm->repl_mutex);
+				error = 0;
+				goto out_put_mm;
+			}
+			
+			pgtable_repl_disable(mm);
+			error = 0;
+			goto out_put_mm;
+		} 
+		
+		/* --- ENABLE LOGIC (arg2 >= 1) --- */
+		
+		/* Pre-requisite: Need at least 2 nodes to be useful */
+		if (num_online_nodes() <= 1) {
+			error = -EINVAL;
+			goto out_put_mm;
+		}
+		
+		if (arg2 == 1) {
+			/* Enable on ALL online nodes */
+			nodes = node_online_map;
+		} else {
+			/* Enable on SPECIFIC nodes (bitmask provided in arg2) */
+			nodes_clear(nodes);
+			for (node = 0; node < max_node; node++) {
+				if (arg2 & (1UL << node)) {
+					if (!node_online(node)) {
+						error = -EINVAL;
+						goto out_put_mm;
+					}
+					node_set(node, nodes);
+					valid_nodes++;
+				}
+			}
+			if (valid_nodes < 2) {
+				error = -EINVAL;
+				goto out_put_mm;
+			}
+		}
+		
+		/* Check if already enabled with IDENTICAL nodes */
+		if (mm->repl_pgd_enabled && nodes_equal(mm->repl_pgd_nodes, nodes)) {
+			error = 0; /* Already done, return success */
+			goto out_put_mm;
+		}
+		
+		/* Check if enabled with DIFFERENT nodes (Re-enabling not supported without disabling first) */
+		if (mm->repl_pgd_enabled) {
+			error = -EALREADY;
+			goto out_put_mm;
+		}
+		
+		/* Perform the Enable */
+		ret = pgtable_repl_enable(mm, nodes);
+		
+		if (ret) {
+			error = ret;
+		} else {
+			flush_tlb_mm(mm);
+			error = 0;
+		}
+
+	out_put_mm:
+		if (mm)
+			mmput(mm);
+		break;
+	}
+case PR_GET_PGTABLE_REPL:
+{
+	unsigned long mask = 0;
+	int node;
+	int max_node = min(MAX_NUMNODES, (int)BITS_PER_LONG);
+	
+	if (current->mm && current->mm->repl_pgd_enabled) {
+		for_each_node_mask(node, current->mm->repl_pgd_nodes) {
+			/* Only set bits that fit in unsigned long */
+			if (node < max_node)
+				mask |= (1UL << node);
+		}
+		error = (long)mask;
+	} else {
+		error = 0;
+	}
+	break;
+}
+case PR_SET_PGTABLE_REPL_NODE:
+{
+	struct mm_struct *mm = NULL;
+	struct task_struct *task = NULL;
+	int target_node = (int)arg2;  /* -1 = auto, >=0 = force specific node */
+	bool is_self = (arg3 == 0);
+	
+	/* Security: Only root/CAP_SYS_NICE can change */
+	if (!capable(CAP_SYS_NICE)) {
+		return -EPERM;
+	}
+	
+	/* Select target task based on arg3 (PID) */
+	if (!is_self) {
+		rcu_read_lock();
+		task = find_task_by_vpid((pid_t)arg3);
+		if (task)
+			get_task_struct(task);
+		rcu_read_unlock();
+		
+		if (!task)
+			return -ESRCH;
+		
+		mm = get_task_mm(task);
+	} else {
+		task = current;
+		mm = current->mm;
+		if (mm)
+			mmget(mm);
+	}
+	
+	if (!mm) {
+		if (!is_self && task)
+			put_task_struct(task);
+		return -EINVAL;
+	}
+	
+	/* Must have replication enabled to force a node */
+	if (!mm->repl_pgd_enabled) {
+		error = -EINVAL;
+		goto out_put_mm_node;
+	}
+	
+	/* Validate target_node */
+	if (target_node < -1 || target_node >= MAX_NUMNODES) {
+		error = -EINVAL;
+		goto out_put_mm_node;
+	}
+	
+	/* If forcing a specific node, verify it has a replica */
+	if (target_node >= 0) {
+		if (!node_isset(target_node, mm->repl_pgd_nodes) ||
+		    mm->pgd_replicas[target_node] == NULL) {
+			error = -EINVAL;
+			goto out_put_mm_node;
+		}
+	}
+	
+	/* Set the forced node on the TASK, not the mm */
+	WRITE_ONCE(task->repl_forced_node, target_node);
+	smp_wmb();
+	
+	/* Lazy CR3 switching: task will get correct replica on next context switch */
+	
+	error = 0;
+
+out_put_mm_node:
+	if (mm)
+		mmput(mm);
+	if (!is_self && task)
+		put_task_struct(task);
+	break;
+}
+case PR_GET_PGTABLE_REPL_NODE:
+{
+	struct mm_struct *mm = NULL;
+	struct task_struct *task = NULL;
+	bool is_self = (arg2 == 0);
+	
+	/* Select target task based on arg2 (PID) */
+	if (!is_self) {
+		rcu_read_lock();
+		task = find_task_by_vpid((pid_t)arg2);
+		if (task)
+			get_task_struct(task);
+		rcu_read_unlock();
+		
+		if (!task)
+			return -ESRCH;
+		
+		mm = get_task_mm(task);
+	} else {
+		task = current;
+		mm = current->mm;
+		if (mm)
+			mmget(mm);
+	}
+	
+	if (!mm) {
+		if (!is_self && task)
+			put_task_struct(task);
+		return -EINVAL;
+	}
+	
+	if (mm->repl_pgd_enabled) {
+		error = (long)task->repl_forced_node;
+	} else {
+		error = -1;  /* Not enabled, return auto */
+	}
+	
+	mmput(mm);
+	if (!is_self && task)
+		put_task_struct(task);
+	break;
+}
+#endif
 	default:
 		trace_task_prctl_unknown(option, arg2, arg3, arg4, arg5);
 		error = -EINVAL;

@@ -166,7 +166,10 @@ struct pv_mmu_ops {
 
 	/* Pagetable manipulation functions */
 	void (*set_pte)(pte_t *ptep, pte_t pteval);
+	pte_t (*get_pte)(pte_t *ptep);
+
 	void (*set_pmd)(pmd_t *pmdp, pmd_t pmdval);
+	pmd_t (*get_pmd)(pmd_t *pmdp);
 
 	pte_t (*ptep_modify_prot_start)(struct vm_area_struct *vma, unsigned long addr,
 					pte_t *ptep);
@@ -180,6 +183,7 @@ struct pv_mmu_ops {
 	struct paravirt_callee_save make_pgd;
 
 	void (*set_pud)(pud_t *pudp, pud_t pudval);
+	pud_t (*get_pud)(pud_t *pudp);
 
 	struct paravirt_callee_save pmd_val;
 	struct paravirt_callee_save make_pmd;
@@ -188,12 +192,14 @@ struct pv_mmu_ops {
 	struct paravirt_callee_save make_pud;
 
 	void (*set_p4d)(p4d_t *p4dp, p4d_t p4dval);
+	p4d_t (*get_p4d)(p4d_t *p4dp);
 
 #if CONFIG_PGTABLE_LEVELS >= 5
 	struct paravirt_callee_save p4d_val;
 	struct paravirt_callee_save make_p4d;
 
 	void (*set_pgd)(pgd_t *pgdp, pgd_t pgdval);
+	pgd_t (*get_pgd)(pgd_t *pgdp);
 #endif	/* CONFIG_PGTABLE_LEVELS >= 5 */
 
 	struct pv_lazy_ops lazy_mode;
@@ -205,6 +211,7 @@ struct pv_mmu_ops {
 	void (*set_fixmap)(unsigned /* enum fixed_addresses */ idx,
 			   phys_addr_t phys, pgprot_t flags);
 #endif
+
 } __no_randomize_layout;
 
 struct arch_spinlock;

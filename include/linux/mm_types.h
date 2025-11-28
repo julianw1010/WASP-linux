@@ -20,8 +20,9 @@
 #include <linux/seqlock.h>
 #include <linux/percpu_counter.h>
 #include <linux/types.h>
-
+#include <asm/pgtable_repl.h>
 #include <asm/mmu.h>
+
 
 #ifndef AT_VECTOR_SIZE_ARCH
 #define AT_VECTOR_SIZE_ARCH 0
@@ -223,6 +224,9 @@ struct page {
 	 */
 	struct page *kmsan_shadow;
 	struct page *kmsan_origin;
+#endif
+#ifdef CONFIG_PGTABLE_REPLICATION
+    struct page *replica;  /* Circular linked list of replica pages */
 #endif
 } _struct_page_alignment;
 
@@ -922,6 +926,17 @@ struct mm_struct {
 		unsigned long mmap_compat_legacy_base;
 #endif
 		unsigned long task_size;	/* size of task vm space */
+#ifdef CONFIG_PGTABLE_REPLICATION
+	bool repl_pgd_enabled;           /* Is replication active for this mm? */
+	bool repl_in_progress;
+	bool repl_pending_enable;        
+	nodemask_t repl_pgd_nodes;       /* Which nodes have replicas */
+	nodemask_t repl_pending_nodes;   
+	struct mutex repl_mutex;
+	spinlock_t repl_alloc_lock;        /* Spinlock for replica allocation in atomic context */
+	pgd_t *pgd_replicas[MAX_NUMNODES];
+	pgd_t *original_pgd;
+#endif
 		pgd_t * pgd;
 
 #ifdef CONFIG_MEMBARRIER

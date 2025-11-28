@@ -32,6 +32,10 @@
 
 #include "internal.h"
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#endif
+
 /* Classify the kind of remap operation being performed. */
 enum mremap_type {
 	MREMAP_INVALID,		/* Initial state. */
@@ -169,7 +173,6 @@ static pte_t move_soft_dirty_pte(pte_t pte)
 #endif
 	return pte;
 }
-
 static int move_ptes(struct pagetable_move_control *pmc,
 		unsigned long extent, pmd_t *old_pmd, pmd_t *new_pmd)
 {
@@ -185,7 +188,7 @@ static int move_ptes(struct pagetable_move_control *pmc,
 	unsigned long old_end = old_addr + extent;
 	unsigned long len = old_end - old_addr;
 	int err = 0;
-
+	
 	/*
 	 * When need_rmap_locks is true, we take the i_mmap_rwsem and anon_vma
 	 * locks to ensure that rmap will always observe either the old or the
@@ -206,7 +209,6 @@ static int move_ptes(struct pagetable_move_control *pmc,
 	 */
 	if (pmc->need_rmap_locks)
 		take_rmap_locks(vma);
-
 	/*
 	 * We don't have to worry about the ordering of src and dst
 	 * pte locks because exclusive mmap_lock prevents deadlock.
@@ -230,16 +232,15 @@ static int move_ptes(struct pagetable_move_control *pmc,
 		err = -EAGAIN;
 		goto out;
 	}
+	
 	if (new_ptl != old_ptl)
 		spin_lock_nested(new_ptl, SINGLE_DEPTH_NESTING);
 	flush_tlb_batched_pending(vma->vm_mm);
 	arch_enter_lazy_mmu_mode();
-
 	for (; old_addr < old_end; old_pte++, old_addr += PAGE_SIZE,
 				   new_pte++, new_addr += PAGE_SIZE) {
 		if (pte_none(ptep_get(old_pte)))
 			continue;
-
 		pte = ptep_get_and_clear(mm, old_addr, old_pte);
 		/*
 		 * If we are remapping a valid PTE, make sure
@@ -256,7 +257,6 @@ static int move_ptes(struct pagetable_move_control *pmc,
 			force_flush = true;
 		pte = move_pte(pte, old_addr, new_addr);
 		pte = move_soft_dirty_pte(pte);
-
 		if (need_clear_uffd_wp && pte_marker_uffd_wp(pte))
 			pte_clear(mm, new_addr, new_pte);
 		else {
@@ -269,7 +269,6 @@ static int move_ptes(struct pagetable_move_control *pmc,
 			set_pte_at(mm, new_addr, new_pte, pte);
 		}
 	}
-
 	arch_leave_lazy_mmu_mode();
 	if (force_flush)
 		flush_tlb_range(vma, old_end - len, old_end);
@@ -759,25 +758,24 @@ unsigned long move_page_tables(struct pagetable_move_control *pmc)
 	pmd_t *old_pmd, *new_pmd;
 	pud_t *old_pud, *new_pud;
 	struct mm_struct *mm = pmc->old->vm_mm;
-
+	
 	if (!pmc->len_in)
 		return 0;
-
+	
 	if (is_vm_hugetlb_page(pmc->old))
 		return move_hugetlb_page_tables(pmc->old, pmc->new, pmc->old_addr,
 						pmc->new_addr, pmc->len_in);
-
 	/*
 	 * If possible, realign addresses to PMD boundary for faster copy.
 	 * Only realign if the mremap copying hits a PMD boundary.
 	 */
 	try_realign_addr(pmc, PMD_MASK);
-
+	
 	flush_cache_range(pmc->old, pmc->old_addr, pmc->old_end);
 	mmu_notifier_range_init(&range, MMU_NOTIFY_UNMAP, 0, mm,
 				pmc->old_addr, pmc->old_end);
 	mmu_notifier_invalidate_range_start(&range);
-
+	
 	for (; !pmc_done(pmc); pmc_next(pmc, extent)) {
 		cond_resched();
 		/*
@@ -785,7 +783,6 @@ unsigned long move_page_tables(struct pagetable_move_control *pmc)
 		 * PUD level if possible.
 		 */
 		extent = get_extent(NORMAL_PUD, pmc);
-
 		old_pud = get_old_pud(mm, pmc->old_addr);
 		if (!old_pud)
 			continue;
@@ -802,7 +799,7 @@ unsigned long move_page_tables(struct pagetable_move_control *pmc)
 			if (move_pgt_entry(pmc, NORMAL_PUD, old_pud, new_pud))
 				continue;
 		}
-
+		
 		extent = get_extent(NORMAL_PMD, pmc);
 		old_pmd = get_old_pmd(mm, pmc->old_addr);
 		if (!old_pmd)
@@ -828,14 +825,15 @@ again:
 		}
 		if (pmd_none(*old_pmd))
 			continue;
+		
 		if (pte_alloc(pmc->new->vm_mm, new_pmd))
 			break;
+		
 		if (move_ptes(pmc, extent, old_pmd, new_pmd) < 0)
 			goto again;
 	}
-
+	
 	mmu_notifier_invalidate_range_end(&range);
-
 	return pmc_progress(pmc);
 }
 

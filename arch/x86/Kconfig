@@ -798,7 +798,13 @@ config PARAVIRT
 	  the kernel is theoretically slower and slightly larger.
 
 config PARAVIRT_XXL
-	bool
+	bool "Full paravirtualization for page tables" if !XEN_PV
+	depends on PARAVIRT
+	default y if XEN_PV || HYPERV
+	help
+	  Enable paravirtualized operations for page table management.
+	  This is automatically selected by hypervisors but can also be
+	  enabled for other MM features like page table replication.
 
 config PARAVIRT_DEBUG
 	bool "paravirt-ops debugging"
@@ -1559,7 +1565,17 @@ config X86_64_ACPI_NUMA
 	select ACPI_NUMA
 	help
 	  Enable ACPI SRAT based node topology detection.
-
+config PGTABLE_REPLICATION
+	bool "Page table replication support"
+	depends on X86_64 && NUMA && SMP && PARAVIRT_XXL
+	default n
+	help
+	  Enable replication of page tables across NUMA nodes.
+	  This feature replicates the Page Global Directory (PGD) 
+	  across NUMA nodes to reduce remote memory accesses during
+	  page table walks.
+	  
+	  If unsure, say N.
 config NODES_SHIFT
 	int "Maximum NUMA Nodes (as a power of 2)" if !MAXSMP
 	range 1 10
@@ -2462,7 +2478,8 @@ config PREFIX_SYMBOLS
 
 menuconfig CPU_MITIGATIONS
 	bool "Mitigations for CPU vulnerabilities"
-	default y
+	default n
+	depends on BROKEN
 	help
 	  Say Y here to enable options which enable mitigations for hardware
 	  vulnerabilities (usually related to speculative execution).

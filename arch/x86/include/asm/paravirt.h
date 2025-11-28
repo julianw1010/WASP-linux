@@ -167,7 +167,7 @@ static inline unsigned long __read_cr3(void)
 
 static inline void write_cr3(unsigned long x)
 {
-	PVOP_ALT_VCALL1(mmu.write_cr3, x, "mov %%rdi, %%cr3", ALT_NOT_XEN);
+	PVOP_VCALL1(mmu.write_cr3, x);
 }
 
 static inline void __write_cr4(unsigned long x)
@@ -424,6 +424,12 @@ static inline void set_pte(pte_t *ptep, pte_t pte)
 	PVOP_VCALL2(mmu.set_pte, ptep, pte.pte);
 }
 
+static inline pte_t get_pte(pte_t *ptep)
+{
+	pteval_t val = PVOP_CALL1(pteval_t, mmu.get_pte, ptep);
+	return __pte(val);
+}
+
 static inline void set_pmd(pmd_t *pmdp, pmd_t pmd)
 {
 	PVOP_VCALL2(mmu.set_pmd, pmdp, native_pmd_val(pmd));
@@ -433,6 +439,12 @@ static inline pmd_t __pmd(pmdval_t val)
 {
 	return (pmd_t) { PVOP_ALT_CALLEE1(pmdval_t, mmu.make_pmd, val,
 					  "mov %%rdi, %%rax", ALT_NOT_XEN) };
+}
+
+static inline pmd_t get_pmd(pmd_t *pmdp)
+{
+	pmdval_t val = PVOP_CALL1(pmdval_t, mmu.get_pmd, pmdp);
+	return __pmd(val);
 }
 
 static inline pmdval_t pmd_val(pmd_t pmd)
@@ -454,6 +466,12 @@ static inline pud_t __pud(pudval_t val)
 			       "mov %%rdi, %%rax", ALT_NOT_XEN);
 
 	return (pud_t) { ret };
+}
+
+static inline pud_t get_pud(pud_t *pudp)
+{
+	pudval_t val = PVOP_CALL1(pudval_t, mmu.get_pud, pudp);
+	return __pud(val);
 }
 
 static inline pudval_t pud_val(pud_t pud)
@@ -484,6 +502,12 @@ static inline p4d_t __p4d(p4dval_t val)
 	return (p4d_t) { ret };
 }
 
+static inline p4d_t get_p4d(p4d_t *p4dp)
+{
+	p4dval_t val = PVOP_CALL1(p4dval_t, mmu.get_p4d, p4dp);
+	return __p4d(val);
+}
+
 static inline p4dval_t p4d_val(p4d_t p4d)
 {
 	return PVOP_ALT_CALLEE1(p4dval_t, mmu.p4d_val, p4d.p4d,
@@ -493,6 +517,12 @@ static inline p4dval_t p4d_val(p4d_t p4d)
 static inline void __set_pgd(pgd_t *pgdp, pgd_t pgd)
 {
 	PVOP_VCALL2(mmu.set_pgd, pgdp, native_pgd_val(pgd));
+}
+
+static inline pgd_t get_pgd(pgd_t *pgdp)
+{
+	pgdval_t val = PVOP_CALL1(pgdval_t, mmu.get_pgd, pgdp);
+	return __pgd(val);
 }
 
 #define set_pgd(pgdp, pgdval) do {					\

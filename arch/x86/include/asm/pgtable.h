@@ -21,6 +21,7 @@
 #include <asm/pkru.h>
 #include <asm/fpu/api.h>
 #include <asm/coco.h>
+#include <asm/pgtable_repl.h>
 #include <asm-generic/pgtable_uffd.h>
 #include <linux/page_table_check.h>
 
@@ -65,28 +66,28 @@ extern pmdval_t early_pmd_flags;
 #ifdef CONFIG_PARAVIRT_XXL
 #include <asm/paravirt.h>
 #else  /* !CONFIG_PARAVIRT_XXL */
-#define set_pte(ptep, pte)		native_set_pte(ptep, pte)
+
+
+#define set_pte(ptep, pte) native_set_pte(ptep, pte)
 
 #define set_pte_atomic(ptep, pte)					\
 	native_set_pte_atomic(ptep, pte)
 
-#define set_pmd(pmdp, pmd)		native_set_pmd(pmdp, pmd)
+#define set_pmd(pmdp, pmd) native_set_pmd(pmdp, pmd)
 
 #ifndef __PAGETABLE_P4D_FOLDED
-#define set_pgd(pgdp, pgd)		native_set_pgd(pgdp, pgd)
+#define set_pgd(pgdp, pgdval) native_set_pgd(pgdp, pgdval)
 #define pgd_clear(pgd)			(pgtable_l5_enabled() ? native_pgd_clear(pgd) : 0)
 #endif
 
-#ifndef set_p4d
-# define set_p4d(p4dp, p4d)		native_set_p4d(p4dp, p4d)
-#endif
+#define set_p4d(p4dp, p4d)	native_set_p4d(p4dp, p4d)
 
 #ifndef __PAGETABLE_PUD_FOLDED
 #define p4d_clear(p4d)			native_p4d_clear(p4d)
 #endif
 
-#ifndef set_pud
-# define set_pud(pudp, pud)		native_set_pud(pudp, pud)
+#ifndef __PAGETABLE_PUD_FOLDED
+#define set_pud(pudp, pud) native_set_pud(pudp, pud)
 #endif
 
 #ifndef __PAGETABLE_PUD_FOLDED
@@ -94,7 +95,8 @@ extern pmdval_t early_pmd_flags;
 #endif
 
 #define pte_clear(mm, addr, ptep)	native_pte_clear(mm, addr, ptep)
-#define pmd_clear(pmd)			native_pmd_clear(pmd)
+
+#define pmd_clear(pmd) native_pmd_clear(pmd)
 
 #define pgd_val(x)	native_pgd_val(x)
 #define __pgd(x)	native_make_pgd(x)
@@ -119,6 +121,64 @@ extern pmdval_t early_pmd_flags;
 
 #define arch_end_context_switch(prev)	do {} while(0)
 #endif	/* CONFIG_PARAVIRT_XXL */
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+#define ptep_get ptep_get
+static inline pte_t ptep_get(pte_t *ptep)
+{
+	return pgtable_repl_get_pte(ptep);
+}
+
+#undef pte_clear
+#define pte_clear(mm, addr, ptep) \
+	do { \
+		if ((mm) != NULL && (mm) != &init_mm && (mm)->repl_pgd_enabled) { \
+			pgtable_repl_clear_pte((ptep), (mm)); \
+		} else { \
+			native_pte_clear((mm), (addr), (ptep)); \
+		} \
+	} while (0)
+
+#undef pmd_clear
+#define pmd_clear(pmd) \
+	do { \
+		struct mm_struct *__mm = current ? current->mm : NULL; \
+		if (__mm != NULL && __mm != &init_mm && __mm->repl_pgd_enabled) \
+			pgtable_repl_clear_pmd(pmd); \
+		else \
+			native_pmd_clear(pmd); \
+	} while (0)
+
+#undef pud_clear
+#define pud_clear(pud) \
+	do { \
+		struct mm_struct *__mm = current ? current->mm : NULL; \
+		if (__mm != NULL && __mm != &init_mm && __mm->repl_pgd_enabled) \
+			pgtable_repl_clear_pud(pud); \
+		else \
+			native_pud_clear(pud); \
+	} while (0)
+
+#undef p4d_clear
+#define p4d_clear(p4d) \
+	do { \
+		struct mm_struct *__mm = current ? current->mm : NULL; \
+		if (__mm != NULL && __mm != &init_mm && __mm->repl_pgd_enabled) \
+			pgtable_repl_clear_p4d(p4d); \
+		else \
+			native_p4d_clear(p4d); \
+	} while (0)
+
+#undef pgd_clear
+#define pgd_clear(pgd) \
+	do { \
+		struct mm_struct *__mm = current ? current->mm : NULL; \
+		if (__mm != NULL && __mm != &init_mm && __mm->repl_pgd_enabled) \
+			pgtable_repl_clear_pgd(pgd); \
+		else if (pgtable_l5_enabled()) \
+			native_pgd_clear(pgd); \
+	} while (0)
+#endif
 
 static inline pmd_t pmd_set_flags(pmd_t pmd, pmdval_t set)
 {
@@ -1314,11 +1374,19 @@ extern int ptep_clear_flush_young(struct vm_area_struct *vma,
 				  unsigned long address, pte_t *ptep);
 
 #define __HAVE_ARCH_PTEP_GET_AND_CLEAR
+
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
 				       pte_t *ptep)
 {
 	pte_t pte = native_ptep_get_and_clear(ptep);
 	page_table_check_pte_clear(mm, pte);
+	
+#ifdef CONFIG_PGTABLE_REPLICATION
+	if (mm && mm->repl_pgd_enabled) {
+		pte = pgtable_repl_ptep_get_and_clear(mm, ptep, pte);
+	}
+#endif
+	
 	return pte;
 }
 
@@ -1335,6 +1403,12 @@ static inline pte_t ptep_get_and_clear_full(struct mm_struct *mm,
 		 */
 		pte = native_local_ptep_get_and_clear(ptep);
 		page_table_check_pte_clear(mm, pte);
+#ifdef CONFIG_PGTABLE_REPLICATION
+		/* Must still clear all replicas */
+		if (mm && mm->repl_pgd_enabled) {
+			pgtable_repl_clear_pte(ptep, mm);
+		}
+#endif
 	} else {
 		pte = ptep_get_and_clear(mm, addr, ptep);
 	}
@@ -1386,9 +1460,11 @@ static inline pmd_t pmdp_huge_get_and_clear(struct mm_struct *mm, unsigned long 
 				       pmd_t *pmdp)
 {
 	pmd_t pmd = native_pmdp_get_and_clear(pmdp);
-
 	page_table_check_pmd_clear(mm, pmd);
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+	if (mm && mm->repl_pgd_enabled)
+		pgtable_repl_set_pmd(pmdp, __pmd(0));
+#endif
 	return pmd;
 }
 
@@ -1397,9 +1473,15 @@ static inline pud_t pudp_huge_get_and_clear(struct mm_struct *mm,
 					unsigned long addr, pud_t *pudp)
 {
 	pud_t pud = native_pudp_get_and_clear(pudp);
-
 	page_table_check_pud_clear(mm, pud);
-
+	
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* Clear all replicas after getting the value from primary */
+	if (mm && mm->repl_pgd_enabled) {
+		pgtable_repl_set_pud(pudp, __pud(0));
+	}
+#endif
+	
 	return pud;
 }
 
@@ -1426,13 +1508,19 @@ static inline pmd_t pmdp_establish(struct vm_area_struct *vma,
 		unsigned long address, pmd_t *pmdp, pmd_t pmd)
 {
 	page_table_check_pmd_set(vma->vm_mm, pmdp, pmd);
+	pmd_t old;
 	if (IS_ENABLED(CONFIG_SMP)) {
-		return xchg(pmdp, pmd);
+		old = xchg(pmdp, pmd);
 	} else {
-		pmd_t old = *pmdp;
+		old = *pmdp;
 		WRITE_ONCE(*pmdp, pmd);
-		return old;
 	}
+#ifdef CONFIG_PGTABLE_REPLICATION
+	// Replicate to all nodes
+	if (vma->vm_mm && vma->vm_mm->repl_pgd_enabled)
+		pgtable_repl_set_pmd(pmdp, pmd);
+#endif
+	return old;
 }
 #endif
 
@@ -1441,13 +1529,19 @@ static inline pud_t pudp_establish(struct vm_area_struct *vma,
 		unsigned long address, pud_t *pudp, pud_t pud)
 {
 	page_table_check_pud_set(vma->vm_mm, pudp, pud);
+	pud_t old;
 	if (IS_ENABLED(CONFIG_SMP)) {
-		return xchg(pudp, pud);
+		old = xchg(pudp, pud);
 	} else {
-		pud_t old = *pudp;
+		old = *pudp;
 		WRITE_ONCE(*pudp, pud);
-		return old;
 	}
+#ifdef CONFIG_PGTABLE_REPLICATION
+	// Replicate to all nodes
+	if (vma->vm_mm && vma->vm_mm->repl_pgd_enabled)
+		pgtable_repl_set_pud(pudp, pud);
+#endif
+	return old;
 }
 #endif
 

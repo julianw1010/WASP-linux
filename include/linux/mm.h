@@ -3105,7 +3105,16 @@ static inline void __pagetable_ctor(struct ptdesc *ptdesc)
 static inline void pagetable_dtor(struct ptdesc *ptdesc)
 {
 	struct folio *folio = ptdesc_folio(ptdesc);
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+    {
+        struct page *page = ptdesc_page(ptdesc);
+        if (page->replica) {
+            pr_info("MITOSIS: pagetable_dtor - clearing replica pointer for page %px\n", page);
+            page->replica = NULL;
+            smp_wmb(); /* Ensure NULL is visible before freeing */
+        }
+    }
+#endif
 	ptlock_free(ptdesc);
 	__folio_clear_pgtable(folio);
 	lruvec_stat_sub_folio(folio, NR_PAGETABLE);
@@ -3122,6 +3131,12 @@ static inline bool pagetable_pte_ctor(struct ptdesc *ptdesc)
 	if (!ptlock_init(ptdesc))
 		return false;
 	__pagetable_ctor(ptdesc);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	{
+		struct page *page = ptdesc_page(ptdesc);
+		page->replica = NULL;
+	}
+#endif
 	return true;
 }
 
@@ -3229,6 +3244,12 @@ static inline bool pagetable_pmd_ctor(struct ptdesc *ptdesc)
 		return false;
 	ptdesc_pmd_pts_init(ptdesc);
 	__pagetable_ctor(ptdesc);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	{
+		struct page *page = ptdesc_page(ptdesc);
+		page->replica = NULL;
+	}
+#endif
 	return true;
 }
 
@@ -3254,16 +3275,34 @@ static inline spinlock_t *pud_lock(struct mm_struct *mm, pud_t *pud)
 static inline void pagetable_pud_ctor(struct ptdesc *ptdesc)
 {
 	__pagetable_ctor(ptdesc);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	{
+		struct page *page = ptdesc_page(ptdesc);
+		page->replica = NULL;
+	}
+#endif
 }
 
 static inline void pagetable_p4d_ctor(struct ptdesc *ptdesc)
 {
 	__pagetable_ctor(ptdesc);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	{
+		struct page *page = ptdesc_page(ptdesc);
+		page->replica = NULL;
+	}
+#endif
 }
 
 static inline void pagetable_pgd_ctor(struct ptdesc *ptdesc)
 {
 	__pagetable_ctor(ptdesc);
+#ifdef CONFIG_PGTABLE_REPLICATION
+	{
+		struct page *page = ptdesc_page(ptdesc);
+		page->replica = NULL;
+	}
+#endif
 }
 
 extern void __init pagecache_init(void);

@@ -78,6 +78,10 @@
 
 #include <trace/events/sched.h>
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#endif
+
 static int bprm_creds_from_file(struct linux_binprm *bprm);
 
 int suid_dumpable = 0;
@@ -955,12 +959,27 @@ static int exec_mmap(struct mm_struct *mm)
 	struct task_struct *tsk;
 	struct mm_struct *old_mm, *active_mm;
 	int ret;
+#ifdef CONFIG_PGTABLE_REPLICATION
+	bool had_mitosis = false;
+	nodemask_t saved_nodes;
+#endif
 
 	/* Notify parent that we're no longer interested in the old VM */
 	tsk = current;
 	old_mm = current->mm;
-	exec_mm_release(tsk, old_mm);
+	
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* Save mitosis state before destroying old mm */
+	if (old_mm && old_mm->repl_pgd_enabled) {
+		had_mitosis = true;
+		saved_nodes = old_mm->repl_pgd_nodes;
+		pr_debug("MITOSIS EXEC: Saving mitosis state from old mm (PID %d)\n", tsk->pid);
+		pr_debug("MITOSIS EXEC: Old mm had replication on %d nodes\n", 
+			nodes_weight(saved_nodes));
+	}
+#endif
 
+	exec_mm_release(tsk, old_mm);
 	ret = down_write_killable(&tsk->signal->exec_update_lock);
 	if (ret)
 		return ret;
@@ -980,7 +999,6 @@ static int exec_mmap(struct mm_struct *mm)
 
 	task_lock(tsk);
 	membarrier_exec_mmap(mm);
-
 	local_irq_disable();
 	active_mm = tsk->active_mm;
 	tsk->active_mm = mm;
@@ -1001,6 +1019,40 @@ static int exec_mmap(struct mm_struct *mm)
 	lru_gen_add_mm(mm);
 	task_unlock(tsk);
 	lru_gen_use_mm(mm);
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* 
+	 * Store mitosis state in new mm for later restoration.
+	 * We DON'T restore here because the binary hasn't been loaded yet,
+	 * so there are no memory regions to replicate page tables for.
+	 * The actual restoration happens in bprm_execve() after exec_binprm().
+	 */
+	if (had_mitosis && !nodes_empty(saved_nodes)) {
+		mm->repl_pending_nodes = saved_nodes;
+		mm->repl_pending_enable = true;
+		pr_debug("MITOSIS EXEC: Marked new mm for pending mitosis restoration (PID %d)\n", 
+			tsk->pid);
+		pr_debug("MITOSIS EXEC: Will restore on nodes: %*pbl\n", 
+			nodemask_pr_args(&saved_nodes));
+		
+		/* Verify the new mm starts clean */
+		if (mm->repl_pgd_enabled) {
+			pr_err("MITOSIS EXEC: ERROR - new mm already has replication enabled!\n");
+			mm->repl_pgd_enabled = false;
+		}
+		if (!nodes_empty(mm->repl_pgd_nodes)) {
+			pr_err("MITOSIS EXEC: ERROR - new mm already has nodes set!\n");
+			nodes_clear(mm->repl_pgd_nodes);
+		}
+	} else {
+		/* Ensure new mm starts with clean mitosis state */
+		mm->repl_pending_enable = false;
+		nodes_clear(mm->repl_pending_nodes);
+		mm->repl_pgd_enabled = false;
+		nodes_clear(mm->repl_pgd_nodes);
+	}
+#endif
+
 	if (old_mm) {
 		mmap_read_unlock(old_mm);
 		BUG_ON(active_mm != old_mm);
@@ -1838,11 +1890,9 @@ static int exec_binprm(struct linux_binprm *bprm)
 static int bprm_execve(struct linux_binprm *bprm)
 {
 	int retval;
-
 	retval = prepare_bprm_creds(bprm);
 	if (retval)
 		return retval;
-
 	/*
 	 * Check for unsafe execution states before exec_binprm(), which
 	 * will call back into begin_new_exec(), into bprm_creds_from_file(),
@@ -1851,18 +1901,46 @@ static int bprm_execve(struct linux_binprm *bprm)
 	check_unsafe_exec(bprm);
 	current->in_execve = 1;
 	sched_mm_cid_before_execve(current);
-
 	sched_exec();
-
 	/* Set the unchanging part of bprm->cred */
 	retval = security_bprm_creds_for_exec(bprm);
 	if (retval || bprm->is_check)
 		goto out;
-
 	retval = exec_binprm(bprm);
 	if (retval < 0)
 		goto out;
-
+	
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* Restore mitosis after binary is successfully loaded */
+	{
+		struct mm_struct *mm = current->mm;
+		
+		/* Check if we need to restore mitosis (saved during exec_mmap) */
+		if (mm && mm->repl_pending_enable && !nodes_empty(mm->repl_pending_nodes)) {
+			int res;
+			
+			/* Verify memory regions are set up before enabling */
+			if (mm->start_code == 0 || mm->start_stack == 0) {
+				mm->repl_pending_enable = false;
+				nodes_clear(mm->repl_pending_nodes);
+				goto skip_mitosis_restore;
+			}
+			
+			res = pgtable_repl_enable(mm, mm->repl_pending_nodes);
+			
+			if (res) {
+				/* Not fatal - process continues without mitosis */
+			}
+			
+			/* Clear pending state regardless of success */
+			mm->repl_pending_enable = false;
+			nodes_clear(mm->repl_pending_nodes);
+		}
+skip_mitosis_restore:
+		;
+	}
+#endif
+	
 	sched_mm_cid_after_execve(current);
 	rseq_execve(current);
 	/* execve succeeded */
@@ -1871,7 +1949,6 @@ static int bprm_execve(struct linux_binprm *bprm)
 	acct_update_integrals(current);
 	task_numa_free(current, false);
 	return retval;
-
 out:
 	/*
 	 * If past the point of no return ensure the code never
@@ -1881,11 +1958,18 @@ out:
 	 */
 	if (bprm->point_of_no_return && !fatal_signal_pending(current))
 		force_fatal_sig(SIGSEGV);
-
+		
+#ifdef CONFIG_PGTABLE_REPLICATION
+	/* Clear any pending mitosis state on exec failure */
+	if (current->mm) {
+		current->mm->repl_pending_enable = false;
+		nodes_clear(current->mm->repl_pending_nodes);
+	}
+#endif
+	
 	sched_mm_cid_after_execve(current);
 	rseq_set_notify_resume(current);
 	current->in_execve = 0;
-
 	return retval;
 }
 

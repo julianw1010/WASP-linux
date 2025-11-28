@@ -119,6 +119,10 @@
 
 #include <kunit/visibility.h>
 
+#ifdef CONFIG_PGTABLE_REPLICATION
+#include <asm/pgtable_repl.h>
+#endif
+
 /*
  * Minimum number of threads to boot the kernel
  */
@@ -932,10 +936,8 @@ void __mmdrop(struct mm_struct *mm)
 {
 	BUG_ON(mm == &init_mm);
 	WARN_ON_ONCE(mm == current->mm);
-
 	/* Ensure no CPUs are using this as their lazy tlb mm */
 	cleanup_lazy_tlbs(mm);
-
 	WARN_ON_ONCE(mm == current->active_mm);
 	mm_free_pgd(mm);
 	mm_free_id(mm);
@@ -946,7 +948,6 @@ void __mmdrop(struct mm_struct *mm)
 	mm_pasid_drop(mm);
 	mm_destroy_cid(mm);
 	percpu_counter_destroy_many(mm->rss_stat, NR_MM_COUNTERS);
-
 	free_mm(mm);
 }
 EXPORT_SYMBOL_GPL(__mmdrop);
@@ -1311,7 +1312,6 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 #endif
 	mm_init_uprobes_state(mm);
 	hugetlb_count_init(mm);
-
 	if (current->mm) {
 		mm->flags = mmf_init_flags(current->mm->flags);
 		mm->def_flags = current->mm->def_flags & VM_INIT_DEF_MASK;
@@ -1319,27 +1319,29 @@ static struct mm_struct *mm_init(struct mm_struct *mm, struct task_struct *p,
 		mm->flags = default_dump_filter;
 		mm->def_flags = 0;
 	}
-
 	if (mm_alloc_pgd(mm))
 		goto fail_nopgd;
-
 	if (mm_alloc_id(mm))
 		goto fail_noid;
-
 	if (init_new_context(p, mm))
 		goto fail_nocontext;
-
 	if (mm_alloc_cid(mm, p))
 		goto fail_cid;
-
 	if (percpu_counter_init_many(mm->rss_stat, 0, GFP_KERNEL_ACCOUNT,
-				     NR_MM_COUNTERS))
+				      NR_MM_COUNTERS))
 		goto fail_pcpu;
-
 	mm->user_ns = get_user_ns(user_ns);
 	lru_gen_init_mm(mm);
-	return mm;
+#ifdef CONFIG_PGTABLE_REPLICATION
+	mm->repl_pgd_enabled = false;
+	mm->repl_in_progress = false;
+	nodes_clear(mm->repl_pgd_nodes);
+	mutex_init(&mm->repl_mutex);
+	spin_lock_init(&mm->repl_alloc_lock);
+	memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
+#endif
 
+	return mm;
 fail_pcpu:
 	mm_destroy_cid(mm);
 fail_cid:
@@ -1352,6 +1354,7 @@ fail_nopgd:
 	free_mm(mm);
 	return NULL;
 }
+
 
 /*
  * Allocate and initialize an mm_struct.
@@ -1397,9 +1400,18 @@ static inline void __mmput(struct mm_struct *mm)
 void mmput(struct mm_struct *mm)
 {
 	might_sleep();
-
-	if (atomic_dec_and_test(&mm->mm_users))
+	if (atomic_dec_and_test(&mm->mm_users)) {
+#ifdef CONFIG_PGTABLE_REPLICATION
+		if (mm->repl_pgd_enabled) {
+			WARN_ON_ONCE(atomic_read(&mm->mm_users) != 0);
+			synchronize_rcu();
+			pgtable_repl_disable(mm);
+			WARN_ON_ONCE(mm->repl_pgd_enabled);
+			WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+		}
+#endif
 		__mmput(mm);
+	}
 }
 EXPORT_SYMBOL_GPL(mmput);
 
@@ -1721,78 +1733,190 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 {
 	struct mm_struct *mm;
 	int err;
-
 	mm = allocate_mm();
 	if (!mm)
 		goto fail_nomem;
-
 	memcpy(mm, oldmm, sizeof(*mm));
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+	if (oldmm->repl_pgd_enabled) {
+		WARN_ON_ONCE(nodes_empty(oldmm->repl_pgd_nodes));
+	}
+	mm->repl_pgd_enabled = false;
+	nodes_clear(mm->repl_pgd_nodes);
+	mutex_init(&mm->repl_mutex);
+	spin_lock_init(&mm->repl_alloc_lock);
+	memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
+	WARN_ON_ONCE(mm->repl_pgd_enabled);
+	WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+#endif
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
-
 	uprobe_start_dup_mmap();
 	err = dup_mmap(mm, oldmm);
 	if (err)
 		goto free_pt;
 	uprobe_end_dup_mmap();
-
 	mm->hiwater_rss = get_mm_rss(mm);
 	mm->hiwater_vm = mm->total_vm;
-
 	if (mm->binfmt && !try_module_get(mm->binfmt->module))
 		goto free_pt;
-
 	return mm;
-
 free_pt:
-	/* don't put binfmt in mmput, we haven't got module yet */
 	mm->binfmt = NULL;
 	mm_init_owner(mm, NULL);
 	mmput(mm);
 	if (err)
 		uprobe_end_dup_mmap();
-
 fail_nomem:
 	return NULL;
 }
 
 static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
 {
-	struct mm_struct *mm, *oldmm;
+    struct mm_struct *mm, *oldmm;
 
-	tsk->min_flt = tsk->maj_flt = 0;
-	tsk->nvcsw = tsk->nivcsw = 0;
+    tsk->min_flt = tsk->maj_flt = 0;
+    tsk->nvcsw = tsk->nivcsw = 0;
 #ifdef CONFIG_DETECT_HUNG_TASK
-	tsk->last_switch_count = tsk->nvcsw + tsk->nivcsw;
-	tsk->last_switch_time = 0;
+    tsk->last_switch_count = tsk->nvcsw + tsk->nivcsw;
+    tsk->last_switch_time = 0;
 #endif
 
-	tsk->mm = NULL;
-	tsk->active_mm = NULL;
+    tsk->mm = NULL;
+    tsk->active_mm = NULL;
 
-	/*
-	 * Are we cloning a kernel thread?
-	 *
-	 * We need to steal a active VM for that..
-	 */
-	oldmm = current->mm;
-	if (!oldmm)
-		return 0;
+    oldmm = current->mm;
+    if (!oldmm)
+        return 0;
 
-	if (clone_flags & CLONE_VM) {
-		mmget(oldmm);
-		mm = oldmm;
-	} else {
-		mm = dup_mm(tsk, current->mm);
-		if (!mm)
-			return -ENOMEM;
+    if (clone_flags & CLONE_VM) {
+        mmget(oldmm);
+        mm = oldmm;
+    } else {
+#ifdef CONFIG_PGTABLE_REPLICATION
+        bool parent_had_mitosis = false;
+        bool parent_still_enabled = false;
+        nodemask_t saved_nodes;
+        int ret;
+
+        /* Save parent's mitosis state */
+        if (oldmm->repl_pgd_enabled) {
+            parent_had_mitosis = true;
+            saved_nodes = oldmm->repl_pgd_nodes;
+            
+            // pr_info("MITOSIS FORK: Parent PID %d has mitosis on %d nodes, temporarily disabling\n",
+           //         current->pid, nodes_weight(saved_nodes));
+            
+            /* Disable parent mitosis before dup_mm */
+            pgtable_repl_disable(oldmm);
+            
+            /* Verify disable succeeded */
+            if (oldmm->repl_pgd_enabled) {
+                pr_err("MITOSIS FORK CRITICAL: Failed to disable parent before fork!\n");
+                pr_err("  Parent PID %d, oldmm=%px\n", current->pid, oldmm);
+                return -EFAULT;
+            }
+        }
+
+        /* Duplicate mm with clean page tables */
+        mm = dup_mm(tsk, oldmm);
+        
+        if (!mm) {
+            /* CRITICAL: Restore parent before returning error */
+            if (parent_had_mitosis) {
+                pr_err("MITOSIS FORK: dup_mm failed, restoring parent (PID %d)\n",
+                       current->pid);
+                
+                ret = pgtable_repl_enable(oldmm, saved_nodes);
+                if (ret != 0) {
+                    pr_crit("MITOSIS FORK CRITICAL: Failed emergency parent restore! PID %d, ret=%d\n",
+                            current->pid, ret);
+                }
+            }
+            return -ENOMEM;
+        }
+
+        /* Restore parent's mitosis - no signal check, will always complete */
+        if (parent_had_mitosis) {
+            //pr_info("MITOSIS FORK: Restoring parent mitosis (PID %d)\n", current->pid);
+            
+            ret = pgtable_repl_enable(oldmm, saved_nodes);
+            
+            if (ret != 0) {
+                pr_err("MITOSIS FORK CRITICAL: Failed to restore parent mitosis!\n");
+                pr_err("  Parent PID %d (%s), ret=%d\n", current->pid, current->comm, ret);
+                pr_err("  oldmm=%px, pgd=%px\n", oldmm, oldmm->pgd);
+                pr_err("  Attempted nodes: %*pbl\n", nodemask_pr_args(&saved_nodes));
+                
+                if (ret == -ENOMEM) {
+                    pr_err("  Cause: Out of memory\n");
+                } else if (ret == -EALREADY) {
+                    pr_err("  Cause: Already enabled\n");
+                } else if (ret == -EINVAL) {
+                    pr_err("  Cause: Invalid parameters\n");
+                } else {
+                    pr_err("  Cause: Unknown (ret=%d)\n", ret);
+                }
+                pr_err("  WARNING: Parent process is now in broken state!\n");
+                
+                parent_still_enabled = false;
+            } else {
+               // pr_info("MITOSIS FORK: Parent mitosis restored successfully (PID %d)\n",
+              //          current->pid);
+                parent_still_enabled = true;
+            }
+        }
+
+        /* Determine if child should get mitosis */
+        bool should_enable_child = false;
+        
+        if (parent_had_mitosis && parent_still_enabled && sysctl_mitosis_inherit == 1) {
+            should_enable_child = true;
+        } else if (sysctl_mitosis_auto_enable == 1) {
+	    if (!(tsk->flags & PF_KTHREAD)) {
+		should_enable_child = true;
+	    }
 	}
 
-	tsk->mm = mm;
-	tsk->active_mm = mm;
-	sched_mm_cid_fork(tsk);
-	return 0;
+        /* Enable mitosis for child - no signal check, will always complete */
+        if (should_enable_child) {
+            nodemask_t child_nodes = parent_had_mitosis ? saved_nodes : node_online_map;
+            
+            //pr_info("MITOSIS FORK: Enabling child mitosis (PID %d, parent=%d)\n",
+            //        tsk->pid, current->pid);
+            
+            ret = pgtable_repl_enable(mm, child_nodes);
+            
+            if (ret != 0) {
+                /* Not critical for child */
+                if (ret == -ENOMEM) {
+                    pr_warn("MITOSIS FORK: Child PID %d (%s) running without mitosis (out of memory)\n",
+                            tsk->pid, tsk->comm);
+                    pr_info("  This is acceptable for short-lived processes\n");
+                } else if (ret == -EINVAL) {
+                    pr_err("MITOSIS FORK: Child mitosis enable failed with EINVAL\n");
+                    pr_err("  Child PID %d, mm=%px, pgd=%px\n", tsk->pid, mm, mm->pgd);
+                } else if (ret == -EALREADY) {
+                    pr_warn("MITOSIS FORK: Child already has mitosis enabled (unexpected)\n");
+                } else {
+                    pr_err("MITOSIS FORK: Child mitosis enable failed (ret=%d)\n", ret);
+                }
+            } else {
+                //pr_info("MITOSIS FORK: Child mitosis enabled successfully (PID %d)\n", tsk->pid);
+            }
+        }
+#else
+        mm = dup_mm(tsk, oldmm);
+        if (!mm)
+            return -ENOMEM;
+#endif
+
+    }
+
+    tsk->mm = mm;
+    tsk->active_mm = mm;
+    sched_mm_cid_fork(tsk);
+    return 0;
 }
 
 static int copy_fs(unsigned long clone_flags, struct task_struct *tsk)
@@ -2273,6 +2397,10 @@ __latent_entropy struct task_struct *copy_process(
 	}
 	if (args->io_thread)
 		p->flags |= PF_IO_WORKER;
+		
+	#ifdef CONFIG_PGTABLE_REPLICATION
+	p->repl_forced_node = -1;  /* Default: auto (use local node) */
+	#endif
 
 	if (args->name)
 		strscpy_pad(p->comm, args->name, sizeof(p->comm));

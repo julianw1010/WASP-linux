@@ -15,6 +15,8 @@
 #include <linux/kprobes.h>
 #include <linux/pgtable.h>
 #include <linux/static_call.h>
+#include <linux/sched.h>
+#include <linux/sched/mm.h>
 
 #include <asm/bug.h>
 #include <asm/paravirt.h>
@@ -33,6 +35,9 @@
 #include <asm/tlb.h>
 #include <asm/io_bitmap.h>
 #include <asm/gsseg.h>
+#include <asm/pgtable_repl.h>
+#include <asm/tlbflush.h>  /* for CR3 macros */
+#include <asm/mmu_context.h>
 
 /* stub always returning 0. */
 DEFINE_ASM_FUNC(paravirt_ret0, "xor %eax,%eax", .entry.text);
@@ -86,6 +91,7 @@ static noinstr void pv_native_write_cr2(unsigned long val)
 	native_write_cr2(val);
 }
 
+#ifndef CONFIG_PGTABLE_REPLICATION
 static noinstr unsigned long pv_native_read_cr3(void)
 {
 	return __native_read_cr3();
@@ -95,6 +101,7 @@ static noinstr void pv_native_write_cr3(unsigned long cr3)
 {
 	native_write_cr3(cr3);
 }
+#endif
 
 static noinstr unsigned long pv_native_get_debugreg(int regno)
 {
@@ -179,12 +186,20 @@ struct paravirt_patch_template pv_ops = {
 #ifdef CONFIG_PARAVIRT_XXL
 	.mmu.read_cr2		= __PV_IS_CALLEE_SAVE(pv_native_read_cr2),
 	.mmu.write_cr2		= pv_native_write_cr2,
-	.mmu.read_cr3		= pv_native_read_cr3,
-	.mmu.write_cr3		= pv_native_write_cr3,
-
+	.mmu.read_cr3		= pgtable_repl_read_cr3,
+	.mmu.write_cr3		= pgtable_repl_write_cr3,
 	.mmu.pgd_alloc		= __paravirt_pgd_alloc,
 	.mmu.pgd_free		= paravirt_nop,
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.alloc_pte		= pgtable_repl_alloc_pte,
+	.mmu.alloc_pmd		= pgtable_repl_alloc_pmd,
+	.mmu.alloc_pud		= pgtable_repl_alloc_pud,
+	.mmu.alloc_p4d		= pgtable_repl_alloc_p4d,
+	.mmu.release_pte	= pgtable_repl_release_pte,
+	.mmu.release_pmd	= pgtable_repl_release_pmd,
+	.mmu.release_pud	= pgtable_repl_release_pud,
+	.mmu.release_p4d	= pgtable_repl_release_p4d,
+#else
 	.mmu.alloc_pte		= paravirt_nop,
 	.mmu.alloc_pmd		= paravirt_nop,
 	.mmu.alloc_pud		= paravirt_nop,
@@ -193,29 +208,53 @@ struct paravirt_patch_template pv_ops = {
 	.mmu.release_pmd	= paravirt_nop,
 	.mmu.release_pud	= paravirt_nop,
 	.mmu.release_p4d	= paravirt_nop,
-
+#endif
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.set_pte		= pgtable_repl_set_pte,
+	.mmu.get_pte		= pgtable_repl_get_pte,
+	.mmu.set_pmd		= pgtable_repl_set_pmd,
+	.mmu.get_pmd		= pgtable_repl_get_pmd,
+#else
 	.mmu.set_pte		= native_set_pte,
+	.mmu.get_pte		= native_get_pte,
 	.mmu.set_pmd		= native_set_pmd,
-
+	.mmu.get_pmd		= native_get_pmd,
+#endif
 	.mmu.ptep_modify_prot_start	= __ptep_modify_prot_start,
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.ptep_modify_prot_commit	= pgtable_repl_ptep_modify_prot_commit,
+#else
 	.mmu.ptep_modify_prot_commit	= __ptep_modify_prot_commit,
-
+#endif
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.set_pud		= pgtable_repl_set_pud,
+	.mmu.get_pud		= pgtable_repl_get_pud,
+#else
 	.mmu.set_pud		= native_set_pud,
-
+	.mmu.get_pud		= native_get_pud,
+#endif
 	.mmu.pmd_val		= PTE_IDENT,
 	.mmu.make_pmd		= PTE_IDENT,
-
 	.mmu.pud_val		= PTE_IDENT,
 	.mmu.make_pud		= PTE_IDENT,
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.set_p4d		= pgtable_repl_set_p4d,
+	.mmu.get_p4d		= pgtable_repl_get_p4d,
+#else
 	.mmu.set_p4d		= native_set_p4d,
-
+	.mmu.get_p4d		= native_get_p4d,
+#endif
 #if CONFIG_PGTABLE_LEVELS >= 5
 	.mmu.p4d_val		= PTE_IDENT,
 	.mmu.make_p4d		= PTE_IDENT,
-
+#ifdef CONFIG_PGTABLE_REPLICATION
+	.mmu.set_pgd		= pgtable_repl_set_pgd,
+	.mmu.get_pgd		= pgtable_repl_get_pgd,
+#else
 	.mmu.set_pgd		= native_set_pgd,
-#endif /* CONFIG_PGTABLE_LEVELS >= 5 */
+	.mmu.get_pgd		= native_get_pgd,
+#endif
+#endif
 
 	.mmu.pte_val		= PTE_IDENT,
 	.mmu.pgd_val		= PTE_IDENT,

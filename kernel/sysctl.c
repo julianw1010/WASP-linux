@@ -71,6 +71,8 @@
 #include <linux/rtmutex.h>
 #endif
 
+#include <asm/pgtable_repl.h>
+
 /* shared constants to be used in various sysctls */
 const int sysctl_vals[] = { 0, 1, 2, 3, 4, 100, 200, 1000, 3000, INT_MAX, 65535, -1 };
 EXPORT_SYMBOL(sysctl_vals);
@@ -1588,6 +1590,20 @@ int proc_do_static_key(const struct ctl_table *table, int write,
 }
 
 static const struct ctl_table kern_table[] = {
+	{
+		.procname	= "mitosis_auto_enable",
+		.data		= &sysctl_mitosis_auto_enable,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= mitosis_sysctl_handler,
+	},
+	{
+		.procname	= "mitosis_inherit",
+		.data		= &sysctl_mitosis_inherit,
+		.maxlen		= sizeof(int),
+		.mode		= 0644,
+		.proc_handler	= mitosis_inherit_sysctl_handler,
+	},
 	{
 		.procname	= "panic",
 		.data		= &panic_timeout,
