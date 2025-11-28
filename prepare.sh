@@ -36,4 +36,4 @@ sudo apt install -y \
     systemtap-sdt-dev \
     wget
 
-cp WASP.config .config
+cp wasp.config .config
