@@ -20,18 +20,6 @@ atomic_t total_cr3_writes = ATOMIC_INIT(0);
 atomic_t replica_hits = ATOMIC_INIT(0);
 atomic_t primary_hits = ATOMIC_INIT(0);
 
-
-static atomic64_t debug_set_pte_no_replica = ATOMIC64_INIT(0);
-static atomic64_t debug_set_pte_with_replica = ATOMIC64_INIT(0);
-static atomic64_t debug_set_pte_no_replica_initial = ATOMIC64_INIT(0);
-static atomic64_t debug_set_pte_no_replica_after_spin = ATOMIC64_INIT(0);
-static atomic64_t debug_set_pte_sentinel_spins = ATOMIC64_INIT(0);
-static atomic64_t debug_get_pte_calls = ATOMIC64_INIT(0);
-static atomic64_t debug_get_pte_with_replica = ATOMIC64_INIT(0);
-static atomic64_t debug_get_pte_flags_aggregated = ATOMIC64_INIT(0);
-static atomic64_t debug_ptep_get_and_clear_calls = ATOMIC64_INIT(0);
-static atomic64_t debug_ptep_get_and_clear_aggregated = ATOMIC64_INIT(0);
-
 int sysctl_mitosis_auto_enable = -1;
 int sysctl_mitosis_inherit = 1;
 
@@ -66,32 +54,22 @@ static bool link_page_replicas(struct page **pages, int count)
     if (count < 2)
         return true;
 
-    
-
-    
-    WRITE_ONCE(pages[count - 1]->replica, pages[0]);
-
-    
-    for (i = count - 2; i >= 1; i--) {
+    /* Link into circular list */
+    for (i = 0; i < count - 1; i++) {
         WRITE_ONCE(pages[i]->replica, pages[i + 1]);
     }
+    WRITE_ONCE(pages[count - 1]->replica, pages[0]);
 
-    
     smp_mb();
 
-    
-    WRITE_ONCE(pages[0]->replica, pages[1]);
-
-    
-    smp_mb();
+    /* Validate the circular list */
     p = pages[0];
     for (i = 0; i < count; i++) {
-        if (!p->replica || p->replica == (struct page *)0x1)
+        if (!p->replica)
             BUG();
         p = p->replica;
     }
 
-    
     if (p != pages[0])
         BUG();
 
@@ -104,35 +82,32 @@ static struct page *get_replica_for_node(struct page *base, int target_node)
     struct page *next;
     int iterations = 0;
 
-    
     if (!base)
         BUG();
 
-    
+    /* Check if base is already on target node */
     if (page_to_nid(base) == target_node)
         return base;
 
-    
     page = READ_ONCE(base->replica);
-    if (!page || page == (struct page *)0x1)
+    if (!page)
         BUG();
 
-    
+    /* Walk the circular list looking for target node */
     while (page != base) {
         if (page_to_nid(page) == target_node)
             return page;
 
         next = READ_ONCE(page->replica);
-        if (!next || next == (struct page *)0x1)
+        if (!next)
             BUG();
         page = next;
-        
-        
+
         if (++iterations >= MAX_NUMNODES)
             BUG();
     }
 
-    
+    /* Target node not found in replica chain */
     BUG();
 }
 
@@ -401,7 +376,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     int nodes_updated = 0;
 
     if (!mm || !mm->repl_pgd_enabled) {
@@ -410,39 +384,13 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     }
 
     pte_page = virt_to_page(ptep);
-
     repl = READ_ONCE(pte_page->replica);
 
     if (!repl) {
-        atomic64_inc(&debug_set_pte_no_replica);
-        atomic64_inc(&debug_set_pte_no_replica_initial);
         native_set_pte(ptep, pteval);
         return;
     }
 
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        spin_count++;
-        if (spin_count > 100000) {
-            pr_warn_ratelimited("MITOSIS: set_pte spin timeout after %d spins\n", spin_count);
-            BUG();
-        }
-        repl = READ_ONCE(pte_page->replica);
-    }
-
-    if (spin_count > 0) {
-        atomic64_inc(&debug_set_pte_sentinel_spins);
-    }
-
-    if (!repl) {
-        atomic64_inc(&debug_set_pte_no_replica);
-        atomic64_inc(&debug_set_pte_no_replica_after_spin);
-        pr_warn_ratelimited("MITOSIS: set_pte replica became NULL after spinning %d times!\n", spin_count);
-        native_set_pte(ptep, pteval);
-        return;
-    }
-
-    atomic64_inc(&debug_set_pte_with_replica);
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
     cur_page = pte_page;
@@ -464,11 +412,6 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     } while (cur_page && cur_page != pte_page);
 
     smp_wmb();
-
-    if (nodes_updated != nodes_weight(mm->repl_pgd_nodes)) {
-        pr_err("MITOSIS BUG: set_pte updated %d nodes, expected %d!\n",
-               nodes_updated, nodes_weight(mm->repl_pgd_nodes));
-    }
 }
 
 pte_t pgtable_repl_get_pte(pte_t *ptep)
@@ -478,43 +421,24 @@ pte_t pgtable_repl_get_pte(pte_t *ptep)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     pteval_t val;
-    pteval_t original_flags;
 
     val = pte_val(*ptep);
 
     if (!mm || !mm->repl_pgd_enabled)
         return (pte_t){ .pte = val };
 
-    atomic64_inc(&debug_get_pte_calls);
-
     /* Don't aggregate for non-present or swap entries */
     if (!pte_present((pte_t){ .pte = val }))
         return (pte_t){ .pte = val };
 
     pte_page = virt_to_page(ptep);
-
     repl = READ_ONCE(pte_page->replica);
 
     if (!repl)
         return (pte_t){ .pte = val };
 
-    /* Wait for sentinel if allocation in progress */
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000)
-            return (pte_t){ .pte = val };
-        repl = READ_ONCE(pte_page->replica);
-    }
-
-    if (!repl)
-        return (pte_t){ .pte = val };
-
-    atomic64_inc(&debug_get_pte_with_replica);
-
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
-    original_flags = pte_flags((pte_t){ .pte = val });
 
     /* Walk the circular list and OR together all flags */
     cur_page = pte_page->replica;
@@ -534,10 +458,6 @@ pte_t pgtable_repl_get_pte(pte_t *ptep)
             break;
     }
 
-    /* Check if we actually aggregated any new flags */
-    if (pte_flags((pte_t){ .pte = val }) != original_flags)
-        atomic64_inc(&debug_get_pte_flags_aggregated);
-
     return (pte_t){ .pte = val };
 }
 
@@ -548,7 +468,6 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     unsigned long entry_val = pmd_val(pmdval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = pmd_present(pmdval) && !pmd_trans_huge(pmdval);
@@ -559,22 +478,7 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     }
 
     parent_page = virt_to_page(pmdp);
-
     repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_pmd(pmdp, pmdval);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000) {
-            pr_warn_ratelimited("MITOSIS: set_pmd parent spin timeout\n");
-            BUG();
-        }
-        repl = READ_ONCE(parent_page->replica);
-    }
 
     if (!repl) {
         native_set_pmd(pmdp, pmdval);
@@ -586,22 +490,9 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         unsigned long child_phys = entry_val & pfn_mask;
         if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
             struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl;
-            int child_spin = 0;
+            struct page *cp_repl = READ_ONCE(cp->replica);
             
-            /* Wait for child sentinel - allocation in progress */
-            cp_repl = READ_ONCE(cp->replica);
-            while (cp_repl == (struct page *)0x1) {
-                cpu_relax();
-                if (++child_spin > 100000) {
-                    pr_warn_ratelimited("MITOSIS: set_pmd child sentinel timeout\n");
-                    break;
-                }
-                cp_repl = READ_ONCE(cp->replica);
-            }
-            
-            /* NULL is legitimate (kernel pages), non-NULL means use replicas */
-            if (cp && cp_repl && cp_repl != (struct page *)0x1)
+            if (cp && cp_repl)
                 child_base_page = cp;
         }
     }
@@ -655,7 +546,6 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     pmdval_t val, flags;
 
     val = pmd_val(*pmdp);
@@ -668,19 +558,7 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
         return __pmd(val);
 
     pmd_page = virt_to_page(pmdp);
-
     repl = READ_ONCE(pmd_page->replica);
-
-    if (!repl)
-        return __pmd(val);
-
-    /* Wait for sentinel if allocation in progress */
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000)
-            return __pmd(val);
-        repl = READ_ONCE(pmd_page->replica);
-    }
 
     if (!repl)
         return __pmd(val);
@@ -717,7 +595,6 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     unsigned long entry_val = pud_val(pudval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = pud_present(pudval) && !pud_trans_huge(pudval);
@@ -728,22 +605,7 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     }
 
     parent_page = virt_to_page(pudp);
-
     repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_pud(pudp, pudval);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000) {
-            pr_warn_ratelimited("MITOSIS: set_pud parent spin timeout\n");
-            BUG();
-        }
-        repl = READ_ONCE(parent_page->replica);
-    }
 
     if (!repl) {
         native_set_pud(pudp, pudval);
@@ -755,22 +617,9 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         unsigned long child_phys = entry_val & pfn_mask;
         if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
             struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl;
-            int child_spin = 0;
+            struct page *cp_repl = READ_ONCE(cp->replica);
             
-            /* Wait for child sentinel - allocation in progress */
-            cp_repl = READ_ONCE(cp->replica);
-            while (cp_repl == (struct page *)0x1) {
-                cpu_relax();
-                if (++child_spin > 100000) {
-                    pr_warn_ratelimited("MITOSIS: set_pud child sentinel timeout\n");
-                    break;
-                }
-                cp_repl = READ_ONCE(cp->replica);
-            }
-            
-            /* NULL is legitimate (kernel pages), non-NULL means use replicas */
-            if (cp && cp_repl && cp_repl != (struct page *)0x1)
+            if (cp && cp_repl)
                 child_base_page = cp;
         }
     }
@@ -824,7 +673,6 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     pudval_t val, flags;
 
     val = pud_val(*pudp);
@@ -837,19 +685,7 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
         return __pud(val);
 
     pud_page = virt_to_page(pudp);
-
     repl = READ_ONCE(pud_page->replica);
-
-    if (!repl)
-        return __pud(val);
-
-    /* Wait for sentinel if allocation in progress */
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000)
-            return __pud(val);
-        repl = READ_ONCE(pud_page->replica);
-    }
 
     if (!repl)
         return __pud(val);
@@ -886,7 +722,6 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     unsigned long entry_val = p4d_val(p4dval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = p4d_present(p4dval);
@@ -897,22 +732,7 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     }
 
     parent_page = virt_to_page(p4dp);
-
     repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_p4d(p4dp, p4dval);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000) {
-            pr_warn_ratelimited("MITOSIS: set_p4d parent spin timeout\n");
-            BUG();
-        }
-        repl = READ_ONCE(parent_page->replica);
-    }
 
     if (!repl) {
         native_set_p4d(p4dp, p4dval);
@@ -924,22 +744,9 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         unsigned long child_phys = entry_val & pfn_mask;
         if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
             struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl;
-            int child_spin = 0;
+            struct page *cp_repl = READ_ONCE(cp->replica);
             
-            /* Wait for child sentinel - allocation in progress */
-            cp_repl = READ_ONCE(cp->replica);
-            while (cp_repl == (struct page *)0x1) {
-                cpu_relax();
-                if (++child_spin > 100000) {
-                    pr_warn_ratelimited("MITOSIS: set_p4d child sentinel timeout\n");
-                    break;
-                }
-                cp_repl = READ_ONCE(cp->replica);
-            }
-            
-            /* NULL is legitimate (kernel pages), non-NULL means use replicas */
-            if (cp && cp_repl && cp_repl != (struct page *)0x1)
+            if (cp && cp_repl)
                 child_base_page = cp;
         }
     }
@@ -993,7 +800,6 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     p4dval_t val, flags;
 
     val = p4d_val(*p4dp);
@@ -1005,18 +811,7 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
         return __p4d(val);
 
     p4d_page = virt_to_page(p4dp);
-
     repl = READ_ONCE(p4d_page->replica);
-
-    if (!repl)
-        return __p4d(val);
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000)
-            return __p4d(val);
-        repl = READ_ONCE(p4d_page->replica);
-    }
 
     if (!repl)
         return __p4d(val);
@@ -1024,6 +819,7 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
     flags = p4d_flags(__p4d(val));
 
+    /* Walk the circular list and OR together all flags */
     cur_page = p4d_page;
     do {
         p4d_t *replica_p4d;
@@ -1051,7 +847,6 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     unsigned long entry_val = pgd_val(pgdval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = pgd_present(pgdval);
@@ -1072,22 +867,7 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     if (!mm)
         BUG();
     parent_page = virt_to_page(mm->pgd);
-
     repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_pgd(pgdp, pgdval);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000) {
-            pr_warn_ratelimited("MITOSIS: set_pgd parent spin timeout\n");
-            BUG();
-        }
-        repl = READ_ONCE(parent_page->replica);
-    }
 
     if (!repl) {
         native_set_pgd(pgdp, pgdval);
@@ -1099,22 +879,9 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         unsigned long child_phys = entry_val & pfn_mask;
         if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
             struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl;
-            int child_spin = 0;
+            struct page *cp_repl = READ_ONCE(cp->replica);
             
-            /* Wait for child sentinel - allocation in progress */
-            cp_repl = READ_ONCE(cp->replica);
-            while (cp_repl == (struct page *)0x1) {
-                cpu_relax();
-                if (++child_spin > 100000) {
-                    pr_warn_ratelimited("MITOSIS: set_pgd child sentinel timeout\n");
-                    break;
-                }
-                cp_repl = READ_ONCE(cp->replica);
-            }
-            
-            /* NULL is legitimate (kernel pages), non-NULL means use replicas */
-            if (cp && cp_repl && cp_repl != (struct page *)0x1)
+            if (cp && cp_repl)
                 child_base_page = cp;
         }
     }
@@ -1168,7 +935,6 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
     pgdval_t val, flags;
 
     val = pgd_val(*pgdp);
@@ -1180,18 +946,7 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
         return __pgd(val);
 
     pgd_page = virt_to_page(mm->pgd);
-
     repl = READ_ONCE(pgd_page->replica);
-
-    if (!repl)
-        return __pgd(val);
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 100000)
-            return __pgd(val);
-        repl = READ_ONCE(pgd_page->replica);
-    }
 
     if (!repl)
         return __pgd(val);
@@ -1199,6 +954,7 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
     flags = pgd_flags(__pgd(val));
 
+    /* Walk the circular list and OR together all flags */
     cur_page = pgd_page;
     do {
         pgd_t *replica_pgd;
@@ -1285,7 +1041,6 @@ void pgtable_repl_clear_pte(pte_t *ptep, struct mm_struct *mm)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
 
     if (!ptep)
         BUG();
@@ -1301,22 +1056,6 @@ void pgtable_repl_clear_pte(pte_t *ptep, struct mm_struct *mm)
         BUG();
 
     repl = READ_ONCE(pte_page->replica);
-
-    if (!repl) {
-        native_pte_clear(mm, 0, ptep);
-        smp_wmb();
-        flush_tlb_mm(mm);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 1000000) {
-            pr_err("MITOSIS CRITICAL: clear_pte spin timeout - allocation stuck?\n");
-            BUG();
-        }
-        repl = READ_ONCE(pte_page->replica);
-    }
 
     if (!repl) {
         native_pte_clear(mm, 0, ptep);
@@ -1357,7 +1096,6 @@ void pgtable_repl_clear_pmd(pmd_t *pmdp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
 
     if (!pmdp)
         BUG();
@@ -1373,22 +1111,6 @@ void pgtable_repl_clear_pmd(pmd_t *pmdp)
         BUG();
 
     repl = READ_ONCE(pmd_page->replica);
-
-    if (!repl) {
-        native_pmd_clear(pmdp);
-        smp_wmb();
-        flush_tlb_mm(mm);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 1000000) {
-            pr_err("MITOSIS CRITICAL: clear_pmd spin timeout - allocation stuck?\n");
-            BUG();
-        }
-        repl = READ_ONCE(pmd_page->replica);
-    }
 
     if (!repl) {
         native_pmd_clear(pmdp);
@@ -1420,7 +1142,6 @@ void pgtable_repl_clear_pmd(pmd_t *pmdp)
     flush_tlb_mm(mm);
 }
 
-
 void pgtable_repl_clear_pud(pud_t *pudp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
@@ -1429,7 +1150,6 @@ void pgtable_repl_clear_pud(pud_t *pudp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
 
     if (!pudp)
         BUG();
@@ -1445,22 +1165,6 @@ void pgtable_repl_clear_pud(pud_t *pudp)
         BUG();
 
     repl = READ_ONCE(pud_page->replica);
-
-    if (!repl) {
-        native_pud_clear(pudp);
-        smp_wmb();
-        flush_tlb_mm(mm);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 1000000) {
-            pr_err("MITOSIS CRITICAL: clear_pud spin timeout - allocation stuck?\n");
-            BUG();
-        }
-        repl = READ_ONCE(pud_page->replica);
-    }
 
     if (!repl) {
         native_pud_clear(pudp);
@@ -1492,7 +1196,6 @@ void pgtable_repl_clear_pud(pud_t *pudp)
     flush_tlb_mm(mm);
 }
 
-
 void pgtable_repl_clear_p4d(p4d_t *p4dp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
@@ -1501,7 +1204,6 @@ void pgtable_repl_clear_p4d(p4d_t *p4dp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
 
     if (!p4dp)
         BUG();
@@ -1517,22 +1219,6 @@ void pgtable_repl_clear_p4d(p4d_t *p4dp)
         BUG();
 
     repl = READ_ONCE(p4d_page->replica);
-
-    if (!repl) {
-        native_p4d_clear(p4dp);
-        smp_wmb();
-        flush_tlb_mm(mm);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 1000000) {
-            pr_err("MITOSIS CRITICAL: clear_p4d spin timeout - allocation stuck?\n");
-            BUG();
-        }
-        repl = READ_ONCE(p4d_page->replica);
-    }
 
     if (!repl) {
         native_p4d_clear(p4dp);
@@ -1564,7 +1250,6 @@ void pgtable_repl_clear_p4d(p4d_t *p4dp)
     flush_tlb_mm(mm);
 }
 
-
 void pgtable_repl_clear_pgd(pgd_t *pgdp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
@@ -1573,7 +1258,6 @@ void pgtable_repl_clear_pgd(pgd_t *pgdp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
 
     if (!pgdp)
         BUG();
@@ -1590,23 +1274,6 @@ void pgtable_repl_clear_pgd(pgd_t *pgdp)
         BUG();
 
     repl = READ_ONCE(pgd_page->replica);
-
-    if (!repl) {
-        if (pgtable_l5_enabled())
-            native_pgd_clear(pgdp);
-        smp_wmb();
-        flush_tlb_mm(mm);
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 1000000) {
-            pr_err("MITOSIS CRITICAL: clear_pgd spin timeout - allocation stuck?\n");
-            BUG();
-        }
-        repl = READ_ONCE(pgd_page->replica);
-    }
 
     if (!repl) {
         if (pgtable_l5_enabled())
@@ -1639,9 +1306,6 @@ void pgtable_repl_clear_pgd(pgd_t *pgdp)
     flush_tlb_mm(mm);
 }
 
-
-
-
 void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
                                            unsigned long addr, pte_t *ptep,
                                            pte_t pte)
@@ -1652,7 +1316,6 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int spin_count = 0;
 
     if (!vma || !vma->vm_mm)
         BUG();
@@ -1669,23 +1332,7 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
     }
 
     pte_page = virt_to_page(ptep);
-
     repl = READ_ONCE(pte_page->replica);
-
-    if (!repl) {
-        WRITE_ONCE(*ptep, pte);
-        smp_wmb();
-        return;
-    }
-
-    while (repl == (struct page *)0x1) {
-        cpu_relax();
-        if (++spin_count > 10000) {
-            pr_warn_ratelimited("MITOSIS: ptep_modify_prot_commit spin timeout\n");
-            BUG();
-        }
-        repl = READ_ONCE(pte_page->replica);
-    }
 
     if (!repl) {
         WRITE_ONCE(*ptep, pte);
@@ -2772,24 +2419,6 @@ static int mitosis_status_show(struct seq_file *m, void *v)
 		int pct = (replica_uses * 100) / total_writes;
 		seq_printf(m, "  Replica hit rate: %d%%\n", pct);
 	}
-	
-seq_printf(m, "  set_pte (no replica): %lld\n", atomic64_read(&debug_set_pte_no_replica));
-	seq_printf(m, "    - initial NULL: %lld\n", atomic64_read(&debug_set_pte_no_replica_initial));
-	seq_printf(m, "    - NULL after spin: %lld\n", atomic64_read(&debug_set_pte_no_replica_after_spin));
-	seq_printf(m, "  set_pte sentinel spins: %lld\n", atomic64_read(&debug_set_pte_sentinel_spins));
-	seq_printf(m, "  set_pte (with replica): %lld\n", atomic64_read(&debug_set_pte_with_replica));
-	
-	seq_printf(m, "\nA/D Bit Aggregation Stats:\n");
-seq_printf(m, "  get_pte total calls: %lld\n", 
-           atomic64_read(&debug_get_pte_calls));
-seq_printf(m, "  get_pte with replica: %lld\n", 
-           atomic64_read(&debug_get_pte_with_replica));
-seq_printf(m, "  get_pte flags aggregated: %lld\n", 
-           atomic64_read(&debug_get_pte_flags_aggregated));
-seq_printf(m, "  ptep_get_and_clear calls: %lld\n", 
-           atomic64_read(&debug_ptep_get_and_clear_calls));
-seq_printf(m, "  ptep_get_and_clear aggregated: %lld\n", 
-           atomic64_read(&debug_ptep_get_and_clear_aggregated));
 
 	seq_printf(m, "\nProcesses with replication:\n");
 
@@ -2887,7 +2516,8 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 
     local_irq_save(flags);
 
-    if (cmpxchg(&base_page->replica, NULL, (struct page *)0x1) != NULL) {
+    /* Already has replicas - nothing to do */
+    if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
@@ -2917,10 +2547,6 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     }
 
     smp_mb();
-
-    if (base_page->replica == NULL && count > 1)
-        BUG();
-
     local_irq_restore(flags);
 }
 
@@ -2938,7 +2564,8 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 
     local_irq_save(flags);
 
-    if (cmpxchg(&base_page->replica, NULL, (struct page *)0x1) != NULL) {
+    /* Already has replicas - nothing to do */
+    if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
@@ -2968,10 +2595,6 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
     }
 
     smp_mb();
-
-    if (base_page->replica == NULL && count > 1)
-        BUG();
-
     local_irq_restore(flags);
 }
 
@@ -2989,7 +2612,8 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 
     local_irq_save(flags);
 
-    if (cmpxchg(&base_page->replica, NULL, (struct page *)0x1) != NULL) {
+    /* Already has replicas - nothing to do */
+    if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
@@ -3019,10 +2643,6 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
     }
 
     smp_mb();
-
-    if (base_page->replica == NULL && count > 1)
-        BUG();
-
     local_irq_restore(flags);
 }
 
@@ -3043,7 +2663,8 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 
     local_irq_save(flags);
 
-    if (cmpxchg(&base_page->replica, NULL, (struct page *)0x1) != NULL) {
+    /* Already has replicas - nothing to do */
+    if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
@@ -3073,10 +2694,6 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
     }
 
     smp_mb();
-
-    if (base_page->replica == NULL && count > 1)
-        BUG();
-
     local_irq_restore(flags);
 }
 
@@ -3351,9 +2968,6 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep, pte_t p
     unsigned long offset;
     int iterations = 0;
     pteval_t flags;
-    pteval_t original_flags;
-
-    atomic64_inc(&debug_ptep_get_and_clear_calls);
 
     if (!mm || !mm->repl_pgd_enabled)
         return pte;
@@ -3361,13 +2975,13 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep, pte_t p
     pte_page = virt_to_page(ptep);
     repl = READ_ONCE(pte_page->replica);
 
-    if (!repl || repl == (struct page *)0x1)
+    if (!repl)
         return pte;
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     flags = pte_flags(pte);
-    original_flags = flags;
 
+    /* Walk replicas and aggregate flags, clearing each */
     cur_page = pte_page->replica;
     while (cur_page && cur_page != pte_page) {
         pte_t *replica_pte;
@@ -3386,10 +3000,6 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep, pte_t p
         if (iterations >= MAX_NUMNODES)
             break;
     }
-
-    /* Check if we actually aggregated any new flags */
-    if (iterations > 0 && flags != original_flags)
-        atomic64_inc(&debug_ptep_get_and_clear_aggregated);
 
     return pte_set_flags(pte, flags);
 }
