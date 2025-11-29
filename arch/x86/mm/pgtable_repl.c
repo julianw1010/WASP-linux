@@ -444,6 +444,7 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
+    struct mm_struct *mm;
 
     /* Kernel threads or init_mm - never replicated */
     if (!current || !current->mm || current->mm == &init_mm) {
@@ -451,13 +452,23 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         return;
     }
 
+    mm = current->mm;
+    
+    /* Replication not enabled - use native */
+    if (!mm->repl_pgd_enabled) {
+        native_set_pte(ptep, pteval);
+        return;
+    }
+
     pte_page = virt_to_page(ptep);
     repl = READ_ONCE(pte_page->replica);
 
-    /* If this page has no replicas, just use native */
+    /* Create replicas on-demand if missing */
     if (!repl) {
-        native_set_pte(ptep, pteval);
-        return;
+        pgtable_repl_alloc_pte(mm, page_to_pfn(pte_page));
+        repl = READ_ONCE(pte_page->replica);
+        if (!repl)
+            BUG();
     }
 
     /* Track replicated set operation */
@@ -494,6 +505,7 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     unsigned long entry_val = pmd_val(pmdval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = pmd_present(pmdval) && !pmd_trans_huge(pmdval) && entry_val != 0;
+    struct mm_struct *mm;
 
     /* Kernel threads or init_mm - never replicated */
     if (!current || !current->mm || current->mm == &init_mm) {
@@ -501,13 +513,23 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         return;
     }
 
+    mm = current->mm;
+    
+    /* Replication not enabled - use native */
+    if (!mm->repl_pgd_enabled) {
+        native_set_pmd(pmdp, pmdval);
+        return;
+    }
+
     parent_page = virt_to_page(pmdp);
     repl = READ_ONCE(parent_page->replica);
 
-    /* If this page has no replicas, just use native */
+    /* Create parent replicas on-demand if missing */
     if (!repl) {
-        native_set_pmd(pmdp, pmdval);
-        return;
+        pgtable_repl_alloc_pmd(mm, page_to_pfn(parent_page));
+        repl = READ_ONCE(parent_page->replica);
+        if (!repl)
+            BUG();
     }
 
     /* Track replicated set operation */
@@ -523,9 +545,12 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         if (!child_base_page)
             BUG();
 
-        /* Child must have replicas if parent does */
-        if (!READ_ONCE(child_base_page->replica))
-            BUG();
+        /* Create child replicas on-demand if missing */
+        if (!READ_ONCE(child_base_page->replica)) {
+            pgtable_repl_alloc_pte(mm, page_to_pfn(child_base_page));
+            if (!READ_ONCE(child_base_page->replica))
+                BUG();
+        }
     }
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
@@ -588,6 +613,7 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     unsigned long entry_val = pud_val(pudval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = pud_present(pudval) && !pud_trans_huge(pudval) && entry_val != 0;
+    struct mm_struct *mm;
 
     /* Kernel threads or init_mm - never replicated */
     if (!current || !current->mm || current->mm == &init_mm) {
@@ -595,13 +621,23 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         return;
     }
 
+    mm = current->mm;
+    
+    /* Replication not enabled - use native */
+    if (!mm->repl_pgd_enabled) {
+        native_set_pud(pudp, pudval);
+        return;
+    }
+
     parent_page = virt_to_page(pudp);
     repl = READ_ONCE(parent_page->replica);
 
-    /* If this page has no replicas, just use native */
+    /* Create parent replicas on-demand if missing */
     if (!repl) {
-        native_set_pud(pudp, pudval);
-        return;
+        pgtable_repl_alloc_pud(mm, page_to_pfn(parent_page));
+        repl = READ_ONCE(parent_page->replica);
+        if (!repl)
+            BUG();
     }
 
     /* Track replicated set operation */
@@ -617,9 +653,12 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         if (!child_base_page)
             BUG();
 
-        /* Child must have replicas if parent does */
-        if (!READ_ONCE(child_base_page->replica))
-            BUG();
+        /* Create child replicas on-demand if missing */
+        if (!READ_ONCE(child_base_page->replica)) {
+            pgtable_repl_alloc_pmd(mm, page_to_pfn(child_base_page));
+            if (!READ_ONCE(child_base_page->replica))
+                BUG();
+        }
     }
 
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
@@ -682,6 +721,7 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     unsigned long entry_val = p4d_val(p4dval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = p4d_present(p4dval) && entry_val != 0;
+    struct mm_struct *mm;
 
     /* Kernel threads or init_mm - never replicated */
     if (!current || !current->mm || current->mm == &init_mm) {
@@ -689,13 +729,23 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         return;
     }
 
+    mm = current->mm;
+    
+    /* Replication not enabled - use native */
+    if (!mm->repl_pgd_enabled) {
+        native_set_p4d(p4dp, p4dval);
+        return;
+    }
+
     parent_page = virt_to_page(p4dp);
     repl = READ_ONCE(parent_page->replica);
 
-    /* If this page has no replicas, just use native */
+    /* Create parent replicas on-demand if missing */
     if (!repl) {
-        native_set_p4d(p4dp, p4dval);
-        return;
+        pgtable_repl_alloc_p4d(mm, page_to_pfn(parent_page));
+        repl = READ_ONCE(parent_page->replica);
+        if (!repl)
+            BUG();
     }
 
     /* Track replicated set operation */
@@ -711,9 +761,12 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         if (!child_base_page)
             BUG();
 
-        /* Child must have replicas if parent does */
-        if (!READ_ONCE(child_base_page->replica))
-            BUG();
+        /* Create child replicas on-demand if missing */
+        if (!READ_ONCE(child_base_page->replica)) {
+            pgtable_repl_alloc_pud(mm, page_to_pfn(child_base_page));
+            if (!READ_ONCE(child_base_page->replica))
+                BUG();
+        }
     }
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
@@ -776,6 +829,7 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     unsigned long entry_val = pgd_val(pgdval);
     const unsigned long pfn_mask = PTE_PFN_MASK;
     bool has_child = pgd_present(pgdval) && entry_val != 0;
+    struct mm_struct *mm;
 
     /* Kernel threads or init_mm - never replicated */
     if (!current || !current->mm || current->mm == &init_mm) {
@@ -783,14 +837,20 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         return;
     }
 
-    parent_page = virt_to_page(pgdp);
-    repl = READ_ONCE(parent_page->replica);
-
-    /* If this page has no replicas, just use native */
-    if (!repl) {
+    mm = current->mm;
+    
+    /* Replication not enabled - use native */
+    if (!mm->repl_pgd_enabled) {
         native_set_pgd(pgdp, pgdval);
         return;
     }
+
+    parent_page = virt_to_page(pgdp);
+    repl = READ_ONCE(parent_page->replica);
+
+    /* PGD must have replicas if replication is enabled */
+    if (!repl)
+        BUG();
 
     /* Track replicated set operation */
     atomic_inc(&repl_pgd_sets);
@@ -805,9 +865,16 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         if (!child_base_page)
             BUG();
 
-        /* Child must have replicas if parent does */
-        if (!READ_ONCE(child_base_page->replica))
-            BUG();
+        /* Create child replicas on-demand if missing */
+        if (!READ_ONCE(child_base_page->replica)) {
+            if (pgtable_l5_enabled()) {
+                pgtable_repl_alloc_p4d(mm, page_to_pfn(child_base_page));
+            } else {
+                pgtable_repl_alloc_pud(mm, page_to_pfn(child_base_page));
+            }
+            if (!READ_ONCE(child_base_page->replica))
+                BUG();
+        }
     }
 
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
