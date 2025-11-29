@@ -1378,15 +1378,8 @@ extern int ptep_clear_flush_young(struct vm_area_struct *vma,
 static inline pte_t ptep_get_and_clear(struct mm_struct *mm, unsigned long addr,
 				       pte_t *ptep)
 {
-	pte_t pte = native_ptep_get_and_clear(ptep);
+	pte_t pte = pgtable_repl_ptep_get_and_clear(mm, ptep);
 	page_table_check_pte_clear(mm, pte);
-	
-#ifdef CONFIG_PGTABLE_REPLICATION
-	if (mm && mm->repl_pgd_enabled) {
-		pte = pgtable_repl_ptep_get_and_clear(mm, ptep, pte);
-	}
-#endif
-	
 	return pte;
 }
 

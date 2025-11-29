@@ -50,7 +50,7 @@ int mitosis_sysctl_handler(const struct ctl_table *table, int write,
 int mitosis_inherit_sysctl_handler(const struct ctl_table *table, int write,
 				   void *buffer, size_t *lenp, loff_t *ppos); 
 
-pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep, pte_t pte);
+pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep);
 
 #else
 
