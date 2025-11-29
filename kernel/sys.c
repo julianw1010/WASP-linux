@@ -2842,11 +2842,6 @@ case PR_SET_PGTABLE_REPL:
 		int valid_nodes = 0;
 		/* Limit bitmask checks to size of long to prevent overflow */
 		int max_node = min(MAX_NUMNODES, (int)BITS_PER_LONG);
-		
-		/* Security: Only root/CAP_SYS_NICE can change deep memory topology settings */
-		if (!capable(CAP_SYS_NICE)) {
-			return -EPERM;
-		}
 
 		/* WASP Support: Select Target MM based on arg3 (PID) */
 		if (arg3 != 0) {
@@ -2980,11 +2975,6 @@ case PR_SET_PGTABLE_REPL_NODE:
 	struct task_struct *task = NULL;
 	int target_node = (int)arg2;  /* -1 = auto, >=0 = force specific node */
 	bool is_self = (arg3 == 0);
-	
-	/* Security: Only root/CAP_SYS_NICE can change */
-	if (!capable(CAP_SYS_NICE)) {
-		return -EPERM;
-	}
 	
 	/* Select target task based on arg3 (PID) */
 	if (!is_self) {
