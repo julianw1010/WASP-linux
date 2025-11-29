@@ -20,6 +20,28 @@ atomic_t total_cr3_writes = ATOMIC_INIT(0);
 atomic_t replica_hits = ATOMIC_INIT(0);
 atomic_t primary_hits = ATOMIC_INIT(0);
 
+atomic_t repl_pte_sets = ATOMIC_INIT(0);
+atomic_t repl_pmd_sets = ATOMIC_INIT(0);
+atomic_t repl_pud_sets = ATOMIC_INIT(0);
+atomic_t repl_p4d_sets = ATOMIC_INIT(0);
+atomic_t repl_pgd_sets = ATOMIC_INIT(0);
+
+atomic_t repl_pte_clears = ATOMIC_INIT(0);
+atomic_t repl_pmd_clears = ATOMIC_INIT(0);
+atomic_t repl_pud_clears = ATOMIC_INIT(0);
+atomic_t repl_p4d_clears = ATOMIC_INIT(0);
+atomic_t repl_pgd_clears = ATOMIC_INIT(0);
+
+atomic_t repl_pte_gets_aggregated = ATOMIC_INIT(0);
+atomic_t repl_pmd_gets_aggregated = ATOMIC_INIT(0);
+atomic_t repl_pud_gets_aggregated = ATOMIC_INIT(0);
+atomic_t repl_p4d_gets_aggregated = ATOMIC_INIT(0);
+atomic_t repl_pgd_gets_aggregated = ATOMIC_INIT(0);
+
+atomic_t repl_prot_commits = ATOMIC_INIT(0);
+atomic_t repl_ptep_get_and_clears = ATOMIC_INIT(0);
+atomic_t repl_ptep_get_and_clears_aggregated = ATOMIC_INIT(0);
+
 int sysctl_mitosis_auto_enable = -1;
 int sysctl_mitosis_inherit = 1;
 
@@ -438,6 +460,9 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         return;
     }
 
+    /* Track replicated set operation */
+    atomic_inc(&repl_pte_sets);
+
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
     /* Walk ALL replicas in the circular list and update each */
@@ -484,6 +509,9 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         native_set_pmd(pmdp, pmdval);
         return;
     }
+
+    /* Track replicated set operation */
+    atomic_inc(&repl_pmd_sets);
 
     /* Find the base page of the child (PTE) if this PMD points to one */
     if (has_child) {
@@ -576,6 +604,9 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         return;
     }
 
+    /* Track replicated set operation */
+    atomic_inc(&repl_pud_sets);
+
     /* Find the base page of the child (PMD) if this PUD points to one */
     if (has_child) {
         unsigned long child_phys = entry_val & pfn_mask;
@@ -666,6 +697,9 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         native_set_p4d(p4dp, p4dval);
         return;
     }
+
+    /* Track replicated set operation */
+    atomic_inc(&repl_p4d_sets);
 
     /* Find the base page of the child (PUD) if this P4D points to one */
     if (has_child) {
@@ -758,6 +792,9 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         return;
     }
 
+    /* Track replicated set operation */
+    atomic_inc(&repl_pgd_sets);
+
     /* Find the base page of the child (P4D or PUD depending on LA57) */
     if (has_child) {
         unsigned long child_phys = entry_val & pfn_mask;
@@ -832,8 +869,10 @@ pte_t pgtable_repl_get_pte(pte_t *ptep)
     unsigned long offset;
     int iterations = 0;
     pteval_t val;
+    pteval_t original_val;
 
     val = pte_val(*ptep);
+    original_val = val;
 
     if (!mm || !mm->repl_pgd_enabled)
         return (pte_t){ .pte = val };
@@ -867,6 +906,10 @@ pte_t pgtable_repl_get_pte(pte_t *ptep)
             break;
     }
 
+    /* Track if we actually aggregated different flags */
+    if (val != original_val)
+        atomic_inc(&repl_pte_gets_aggregated);
+
     return (pte_t){ .pte = val };
 }
 
@@ -877,7 +920,7 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    pmdval_t val, flags;
+    pmdval_t val, flags, original_flags;
 
     val = pmd_val(*pmdp);
 
@@ -896,6 +939,7 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
     flags = pmd_flags(__pmd(val));
+    original_flags = flags;
 
     /* Walk the circular list and OR together all flags */
     cur_page = pmd_page->replica;
@@ -914,6 +958,10 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
             break;
     }
 
+    /* Track if we actually aggregated different flags */
+    if (flags != original_flags)
+        atomic_inc(&repl_pmd_gets_aggregated);
+
     /* Combine original PFN with aggregated flags */
     return __pmd((val & PTE_PFN_MASK) | flags);
 }
@@ -925,7 +973,7 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    pudval_t val, flags;
+    pudval_t val, flags, original_flags;
 
     val = pud_val(*pudp);
 
@@ -944,6 +992,7 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
 
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
     flags = pud_flags(__pud(val));
+    original_flags = flags;
 
     /* Walk the circular list and OR together all flags */
     cur_page = pud_page->replica;
@@ -962,6 +1011,10 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
             break;
     }
 
+    /* Track if we actually aggregated different flags */
+    if (flags != original_flags)
+        atomic_inc(&repl_pud_gets_aggregated);
+
     /* Combine original PFN with aggregated flags */
     return __pud((val & PTE_PFN_MASK) | flags);
 }
@@ -973,7 +1026,7 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    p4dval_t val, flags;
+    p4dval_t val, flags, original_flags;
 
     val = p4d_val(*p4dp);
 
@@ -991,6 +1044,7 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
     flags = p4d_flags(__p4d(val));
+    original_flags = flags;
 
     /* Walk the circular list and OR together all flags */
     cur_page = p4d_page->replica;
@@ -1009,6 +1063,10 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
             break;
     }
 
+    /* Track if we actually aggregated different flags */
+    if (flags != original_flags)
+        atomic_inc(&repl_p4d_gets_aggregated);
+
     return __p4d((val & PTE_PFN_MASK) | flags);
 }
 
@@ -1019,7 +1077,7 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    pgdval_t val, flags;
+    pgdval_t val, flags, original_flags;
 
     val = pgd_val(*pgdp);
 
@@ -1037,6 +1095,7 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
 
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
     flags = pgd_flags(__pgd(val));
+    original_flags = flags;
 
     /* Walk the circular list and OR together all flags */
     cur_page = pgd_page->replica;
@@ -1055,8 +1114,13 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
             break;
     }
 
+    /* Track if we actually aggregated different flags */
+    if (flags != original_flags)
+        atomic_inc(&repl_pgd_gets_aggregated);
+
     return __pgd((val & PTE_PFN_MASK) | flags);
 }
+
 
 static void free_replica_chain(struct page *base_page)
 {
@@ -1141,6 +1205,9 @@ void pgtable_repl_clear_pte(pte_t *ptep, struct mm_struct *mm)
         return;
     }
 
+    /* Track replicated clear operation */
+    atomic_inc(&repl_pte_clears);
+
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
     /* Walk ALL replicas and clear each */
@@ -1187,6 +1254,9 @@ void pgtable_repl_clear_pmd(pmd_t *pmdp)
         native_pmd_clear(pmdp);
         return;
     }
+
+    /* Track replicated clear operation */
+    atomic_inc(&repl_pmd_clears);
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
 
@@ -1235,6 +1305,9 @@ void pgtable_repl_clear_pud(pud_t *pudp)
         return;
     }
 
+    /* Track replicated clear operation */
+    atomic_inc(&repl_pud_clears);
+
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
 
     /* Walk ALL replicas and clear each */
@@ -1281,6 +1354,9 @@ void pgtable_repl_clear_p4d(p4d_t *p4dp)
         native_p4d_clear(p4dp);
         return;
     }
+
+    /* Track replicated clear operation */
+    atomic_inc(&repl_p4d_clears);
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
 
@@ -1331,6 +1407,9 @@ void pgtable_repl_clear_pgd(pgd_t *pgdp)
         return;
     }
 
+    /* Track replicated clear operation */
+    atomic_inc(&repl_pgd_clears);
+
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
 
     /* Walk ALL replicas and clear each */
@@ -1352,7 +1431,6 @@ void pgtable_repl_clear_pgd(pgd_t *pgdp)
 
     smp_wmb();
 }
-
 
 void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
                                            unsigned long addr, pte_t *ptep,
@@ -1383,6 +1461,9 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
         return;
     }
 
+    /* Track replicated prot commit operation */
+    atomic_inc(&repl_prot_commits);
+
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
     /* PTEs point to data pages - same value for all replicas */
@@ -1404,7 +1485,6 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
 
     smp_wmb();
 }
-
 
 static bool replicate_and_link_page(struct page *page, struct mm_struct *mm,
 				    int (*alloc_fn)(struct page *, struct mm_struct *, struct page **, int *),
@@ -2444,79 +2524,142 @@ int pgtable_repl_init_mm(struct mm_struct *mm)
 
 static int mitosis_status_show(struct seq_file *m, void *v)
 {
-	struct task_struct *p;
-	int total = 0, replicated = 0;
-	int total_writes, replica_uses, primary_uses;
+    struct task_struct *p;
+    int total = 0, replicated = 0;
+    int total_writes, replica_uses, primary_uses;
+    int pte_sets, pmd_sets, pud_sets, p4d_sets, pgd_sets;
+    int pte_clears, pmd_clears, pud_clears, p4d_clears, pgd_clears;
+    int pte_agg, pmd_agg, pud_agg, p4d_agg, pgd_agg;
+    int prot_commits, ptep_get_and_clears;
 
-	seq_printf(m, "Mitosis Page Table Replication Status\n");
-	seq_printf(m, "======================================\n\n");
+    seq_printf(m, "Mitosis Page Table Replication Status\n");
+    seq_printf(m, "======================================\n\n");
 
-	total_writes = atomic_read(&total_cr3_writes);
-	replica_uses = atomic_read(&replica_hits);
-	primary_uses = atomic_read(&primary_hits);
+    /* CR3 statistics */
+    total_writes = atomic_read(&total_cr3_writes);
+    replica_uses = atomic_read(&replica_hits);
+    primary_uses = atomic_read(&primary_hits);
 
-	seq_printf(m, "Statistics:\n");
-	seq_printf(m, "  CR3 writes: %d\n", total_writes);
-	seq_printf(m, "  Replica uses: %d\n", replica_uses);
-	seq_printf(m, "  Primary uses: %d\n", primary_uses);
+    seq_printf(m, "CR3 Statistics:\n");
+    seq_printf(m, "  CR3 writes: %d\n", total_writes);
+    seq_printf(m, "  Replica uses: %d\n", replica_uses);
+    seq_printf(m, "  Primary uses: %d\n", primary_uses);
 
-	if (total_writes > 0) {
-		int pct = (replica_uses * 100) / total_writes;
-		seq_printf(m, "  Replica hit rate: %d%%\n", pct);
-	}
+    if (total_writes > 0) {
+        int pct = (replica_uses * 100) / total_writes;
+        seq_printf(m, "  Replica hit rate: %d%%\n", pct);
+    }
 
-	seq_printf(m, "\nProcesses with replication:\n");
+    /* Setter statistics */
+    pte_sets = atomic_read(&repl_pte_sets);
+    pmd_sets = atomic_read(&repl_pmd_sets);
+    pud_sets = atomic_read(&repl_pud_sets);
+    p4d_sets = atomic_read(&repl_p4d_sets);
+    pgd_sets = atomic_read(&repl_pgd_sets);
 
-	rcu_read_lock();
-	for_each_process(p) {
-		if (p->mm) {
-			total++;
-			if (p->mm->repl_pgd_enabled) {
-				replicated++;
-				seq_printf(m, "  PID %d (%s): nodes=", p->pid, p->comm);
-				int node;
-				int node_count = 0;
-				for_each_node_mask(node, p->mm->repl_pgd_nodes) {
-					seq_printf(m, "%d,", node);
-					node_count++;
-				}
-				seq_printf(m, " (total: %d nodes)\n", node_count);
+    seq_printf(m, "\nReplicated Set Operations:\n");
+    seq_printf(m, "  PTE sets: %d\n", pte_sets);
+    seq_printf(m, "  PMD sets: %d\n", pmd_sets);
+    seq_printf(m, "  PUD sets: %d\n", pud_sets);
+    seq_printf(m, "  P4D sets: %d\n", p4d_sets);
+    seq_printf(m, "  PGD sets: %d\n", pgd_sets);
+    seq_printf(m, "  Total replicated sets: %d\n", 
+               pte_sets + pmd_sets + pud_sets + p4d_sets + pgd_sets);
 
-				if (nodes_empty(p->mm->repl_pgd_nodes)) {
-					seq_printf(m, "    WARNING: Enabled but no nodes set!\n");
-				}
+    /* Clear statistics */
+    pte_clears = atomic_read(&repl_pte_clears);
+    pmd_clears = atomic_read(&repl_pmd_clears);
+    pud_clears = atomic_read(&repl_pud_clears);
+    p4d_clears = atomic_read(&repl_p4d_clears);
+    pgd_clears = atomic_read(&repl_pgd_clears);
 
-				if (p->mm->pgd) {
-					struct page *pgd_page = virt_to_page(p->mm->pgd);
-					seq_printf(m, "    Primary PGD on node %d\n", page_to_nid(pgd_page));
+    seq_printf(m, "\nReplicated Clear Operations:\n");
+    seq_printf(m, "  PTE clears: %d\n", pte_clears);
+    seq_printf(m, "  PMD clears: %d\n", pmd_clears);
+    seq_printf(m, "  PUD clears: %d\n", pud_clears);
+    seq_printf(m, "  P4D clears: %d\n", p4d_clears);
+    seq_printf(m, "  PGD clears: %d\n", pgd_clears);
+    seq_printf(m, "  Total replicated clears: %d\n",
+               pte_clears + pmd_clears + pud_clears + p4d_clears + pgd_clears);
 
-					if (pgd_page->replica) {
-						seq_printf(m, "    Has replica chain\n");
-					} else {
-						seq_printf(m, "    WARNING: No replica chain!\n");
-					}
-				}	
-				
-				if (p->repl_forced_node >= 0) {
-					seq_printf(m, "    WASP Forced Node: %d\n", p->repl_forced_node);
-				} else {
-					seq_printf(m, "    WASP Mode: Auto (local node)\n");
-				}
-			}
-		}
-	}
-	rcu_read_unlock();
+    /* Getter aggregation statistics */
+    pte_agg = atomic_read(&repl_pte_gets_aggregated);
+    pmd_agg = atomic_read(&repl_pmd_gets_aggregated);
+    pud_agg = atomic_read(&repl_pud_gets_aggregated);
+    p4d_agg = atomic_read(&repl_p4d_gets_aggregated);
+    pgd_agg = atomic_read(&repl_pgd_gets_aggregated);
 
-	seq_printf(m, "\nSummary: %d/%d processes using replication\n", replicated,
-		   total);
+    seq_printf(m, "\nGet Operations with Flag Aggregation:\n");
+    seq_printf(m, "  PTE gets (aggregated): %d\n", pte_agg);
+    seq_printf(m, "  PMD gets (aggregated): %d\n", pmd_agg);
+    seq_printf(m, "  PUD gets (aggregated): %d\n", pud_agg);
+    seq_printf(m, "  P4D gets (aggregated): %d\n", p4d_agg);
+    seq_printf(m, "  PGD gets (aggregated): %d\n", pgd_agg);
+    seq_printf(m, "  Total aggregated gets: %d\n",
+               pte_agg + pmd_agg + pud_agg + p4d_agg + pgd_agg);
 
-	if (replicated > 0) {
-		seq_printf(m, "\nReplication is ACTIVE\n");
-	} else {
-		seq_printf(m, "\nReplication is INACTIVE\n");
-	}
+    /* Special operation statistics */
+    prot_commits = atomic_read(&repl_prot_commits);
+    ptep_get_and_clears = atomic_read(&repl_ptep_get_and_clears);
 
-	return 0;
+    seq_printf(m, "\nSpecial Operations:\n");
+    seq_printf(m, "  Prot commits: %d\n", prot_commits);
+    seq_printf(m, "  PTEP get and clear: %d\n", ptep_get_and_clears);
+    seq_printf(m, "  PTEP get and clear (aggregated): %d\n", atomic_read(&repl_ptep_get_and_clears_aggregated));
+
+    seq_printf(m, "\nProcesses with replication:\n");
+
+    rcu_read_lock();
+    for_each_process(p) {
+        if (p->mm) {
+            total++;
+            if (p->mm->repl_pgd_enabled) {
+                int node;
+                int node_count = 0;
+
+                replicated++;
+                seq_printf(m, "  PID %d (%s): nodes=", p->pid, p->comm);
+                for_each_node_mask(node, p->mm->repl_pgd_nodes) {
+                    seq_printf(m, "%d,", node);
+                    node_count++;
+                }
+                seq_printf(m, " (total: %d nodes)\n", node_count);
+
+                if (nodes_empty(p->mm->repl_pgd_nodes)) {
+                    seq_printf(m, "    WARNING: Enabled but no nodes set!\n");
+                }
+
+                if (p->mm->pgd) {
+                    struct page *pgd_page = virt_to_page(p->mm->pgd);
+                    seq_printf(m, "    Primary PGD on node %d\n", page_to_nid(pgd_page));
+
+                    if (pgd_page->replica) {
+                        seq_printf(m, "    Has replica chain\n");
+                    } else {
+                        seq_printf(m, "    WARNING: No replica chain!\n");
+                    }
+                }    
+                
+                if (p->repl_forced_node >= 0) {
+                    seq_printf(m, "    WASP Forced Node: %d\n", p->repl_forced_node);
+                } else {
+                    seq_printf(m, "    WASP Mode: Auto (local node)\n");
+                }
+            }
+        }
+    }
+    rcu_read_unlock();
+
+    seq_printf(m, "\nSummary: %d/%d processes using replication\n", replicated,
+           total);
+
+    if (replicated > 0) {
+        seq_printf(m, "\nReplication is ACTIVE\n");
+    } else {
+        seq_printf(m, "\nReplication is INACTIVE\n");
+    }
+
+    return 0;
 }
 
 static int mitosis_status_open(struct inode *inode, struct file *file)
@@ -3022,6 +3165,7 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
     int iterations = 0;
     pte_t pte;
     pteval_t flags;
+    pteval_t original_flags;
 
     if (!ptep)
         BUG();
@@ -3039,8 +3183,12 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
         return native_ptep_get_and_clear(ptep);
     }
 
+    /* Track replicated ptep_get_and_clear operation */
+    atomic_inc(&repl_ptep_get_and_clears);
+
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
     flags = 0;
+    original_flags = 0;
     pte = __pte(0);
 
     /* Walk ALL replicas, clear each and aggregate flags */
@@ -3056,9 +3204,11 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
         replica_pte = (pte_t *)(page_addr + offset);
         replica_val = native_ptep_get_and_clear(replica_pte);
         
-        /* First iteration: capture the full pte value */
-        if (iterations == 0)
+        /* First iteration: capture the full pte value and original flags */
+        if (iterations == 0) {
             pte = replica_val;
+            original_flags = pte_flags(replica_val);
+        }
         
         flags |= pte_flags(replica_val);
 
@@ -3066,6 +3216,10 @@ pte_t pgtable_repl_ptep_get_and_clear(struct mm_struct *mm, pte_t *ptep)
         if (++iterations >= MAX_NUMNODES)
             BUG();
     } while (cur_page && cur_page != pte_page);
+
+    /* Track if we actually aggregated different flags */
+    if (flags != original_flags)
+        atomic_inc(&repl_ptep_get_and_clears_aggregated);
 
     /* Return pte with aggregated flags from all replicas */
     return pte_set_flags(pte, flags);
