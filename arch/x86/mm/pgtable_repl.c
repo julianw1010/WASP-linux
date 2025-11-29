@@ -2556,12 +2556,13 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     int i, ret;
     unsigned long flags;
 
+    /* Valid early returns - not errors */
     if (!mm || !pfn_valid(pfn))
         return;
 
     base_page = pfn_to_page(pfn);
     if (!base_page)
-        return;
+        BUG();
 
     local_irq_save(flags);
 
@@ -2578,16 +2579,12 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (!src_addr)
+        BUG();
 
     ret = alloc_pte_replicas(base_page, mm, pages, &count);
-    if (ret != 0 || count < 2) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (ret != 0 || count < 2)
+        BUG();
 
     /* Clear replica pointers before linking */
     for (i = 1; i < count; i++)
@@ -2597,16 +2594,8 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
     /* Copy content to all replicas */
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr) {
-            /* Cleanup on failure */
-            for (int k = 1; k < count; k++) {
-                struct ptdesc *pt = page_ptdesc(pages[k]);
-                pagetable_dtor(pt);
-                __free_page(pages[k]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!dst_addr)
+            BUG();
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
@@ -2614,15 +2603,8 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 
     /* Link replicas */
     if (count > 1) {
-        if (!link_page_replicas(pages, count)) {
-            for (i = 1; i < count; i++) {
-                struct ptdesc *pt = page_ptdesc(pages[i]);
-                pagetable_dtor(pt);
-                __free_page(pages[i]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!link_page_replicas(pages, count))
+            BUG();
     }
 
     smp_mb();
@@ -2643,7 +2625,7 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 
     base_page = pfn_to_page(pfn);
     if (!base_page)
-        return;
+        BUG();
 
     local_irq_save(flags);
 
@@ -2658,16 +2640,12 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (!src_addr)
+        BUG();
 
     ret = alloc_pmd_replicas(base_page, mm, pages, &count);
-    if (ret != 0 || count < 2) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (ret != 0 || count < 2)
+        BUG();
 
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
@@ -2675,30 +2653,16 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr) {
-            for (int k = 1; k < count; k++) {
-                struct ptdesc *pt = page_ptdesc(pages[k]);
-                pagetable_dtor(pt);
-                __free_page(pages[k]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!dst_addr)
+            BUG();
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
     if (count > 1) {
-        if (!link_page_replicas(pages, count)) {
-            for (i = 1; i < count; i++) {
-                struct ptdesc *pt = page_ptdesc(pages[i]);
-                pagetable_dtor(pt);
-                __free_page(pages[i]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!link_page_replicas(pages, count))
+            BUG();
     }
 
     smp_mb();
@@ -2719,7 +2683,7 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 
     base_page = pfn_to_page(pfn);
     if (!base_page)
-        return;
+        BUG();
 
     local_irq_save(flags);
 
@@ -2734,16 +2698,12 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (!src_addr)
+        BUG();
 
     ret = alloc_pud_replicas(base_page, mm, pages, &count);
-    if (ret != 0 || count < 2) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (ret != 0 || count < 2)
+        BUG();
 
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
@@ -2751,30 +2711,16 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr) {
-            for (int k = 1; k < count; k++) {
-                struct ptdesc *pt = page_ptdesc(pages[k]);
-                pagetable_dtor(pt);
-                __free_page(pages[k]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!dst_addr)
+            BUG();
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
     if (count > 1) {
-        if (!link_page_replicas(pages, count)) {
-            for (i = 1; i < count; i++) {
-                struct ptdesc *pt = page_ptdesc(pages[i]);
-                pagetable_dtor(pt);
-                __free_page(pages[i]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!link_page_replicas(pages, count))
+            BUG();
     }
 
     smp_mb();
@@ -2798,7 +2744,7 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 
     base_page = pfn_to_page(pfn);
     if (!base_page)
-        return;
+        BUG();
 
     local_irq_save(flags);
 
@@ -2813,16 +2759,12 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (!src_addr)
+        BUG();
 
     ret = alloc_p4d_replicas(base_page, mm, pages, &count);
-    if (ret != 0 || count < 2) {
-        local_irq_restore(flags);
-        return;
-    }
+    if (ret != 0 || count < 2)
+        BUG();
 
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
@@ -2830,30 +2772,16 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr) {
-            for (int k = 1; k < count; k++) {
-                struct ptdesc *pt = page_ptdesc(pages[k]);
-                pagetable_dtor(pt);
-                __free_page(pages[k]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!dst_addr)
+            BUG();
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
     if (count > 1) {
-        if (!link_page_replicas(pages, count)) {
-            for (i = 1; i < count; i++) {
-                struct ptdesc *pt = page_ptdesc(pages[i]);
-                pagetable_dtor(pt);
-                __free_page(pages[i]);
-            }
-            local_irq_restore(flags);
-            return;
-        }
+        if (!link_page_replicas(pages, count))
+            BUG();
     }
 
     smp_mb();
@@ -2865,7 +2793,6 @@ void pgtable_repl_release_pte(unsigned long pfn)
 {
     struct page *page, *cur_page, *next_page;
     int iterations = 0;
-    const char *level_name = "pte";
     unsigned long flags;
 
     if (!pfn_valid(pfn))
@@ -2873,50 +2800,40 @@ void pgtable_repl_release_pte(unsigned long pfn)
 
     page = pfn_to_page(pfn);
     if (!page)
-        return;
+        BUG();
 
-    
     local_irq_save(flags);
 
-    
     cur_page = xchg(&page->replica, NULL);
     if (!cur_page) {
         local_irq_restore(flags);
         return;
     }
 
-    
     while (cur_page && cur_page != page) {
         struct ptdesc *pt;
-        
+
         next_page = cur_page->replica;
-        cur_page->replica = NULL;  
+        cur_page->replica = NULL;
         smp_wmb();
-        
+
         pt = page_ptdesc(cur_page);
         pagetable_dtor(pt);
         __free_page(cur_page);
-        
+
         cur_page = next_page;
-        
-        if (++iterations >= MAX_NUMNODES) {
-            pr_err("MITOSIS CRITICAL: release_%s - infinite loop in replica chain!\n", level_name);
-            local_irq_restore(flags);
+
+        if (++iterations >= MAX_NUMNODES)
             BUG();
-        }
     }
 
     local_irq_restore(flags);
 }
-
-
-
 
 void pgtable_repl_release_pmd(unsigned long pfn)
 {
     struct page *page, *cur_page, *next_page;
     int iterations = 0;
-    const char *level_name = "pmd";
     unsigned long flags;
 
     if (!pfn_valid(pfn))
@@ -2924,50 +2841,40 @@ void pgtable_repl_release_pmd(unsigned long pfn)
 
     page = pfn_to_page(pfn);
     if (!page)
-        return;
+        BUG();
 
-    
     local_irq_save(flags);
 
-    
     cur_page = xchg(&page->replica, NULL);
     if (!cur_page) {
         local_irq_restore(flags);
         return;
     }
 
-    
     while (cur_page && cur_page != page) {
         struct ptdesc *pt;
-        
+
         next_page = cur_page->replica;
-        cur_page->replica = NULL;  
+        cur_page->replica = NULL;
         smp_wmb();
-        
+
         pt = page_ptdesc(cur_page);
         pagetable_dtor(pt);
         __free_page(cur_page);
-        
+
         cur_page = next_page;
-        
-        if (++iterations >= MAX_NUMNODES) {
-            pr_err("MITOSIS CRITICAL: release_%s - infinite loop in replica chain!\n", level_name);
-            local_irq_restore(flags);
+
+        if (++iterations >= MAX_NUMNODES)
             BUG();
-        }
     }
 
     local_irq_restore(flags);
 }
-
-
-
 
 void pgtable_repl_release_pud(unsigned long pfn)
 {
     struct page *page, *cur_page, *next_page;
     int iterations = 0;
-    const char *level_name = "pud";
     unsigned long flags;
 
     if (!pfn_valid(pfn))
@@ -2975,53 +2882,42 @@ void pgtable_repl_release_pud(unsigned long pfn)
 
     page = pfn_to_page(pfn);
     if (!page)
-        return;
+        BUG();
 
-    
     local_irq_save(flags);
 
-    
     cur_page = xchg(&page->replica, NULL);
     if (!cur_page) {
         local_irq_restore(flags);
         return;
     }
 
-    
     while (cur_page && cur_page != page) {
         struct ptdesc *pt;
-        
+
         next_page = cur_page->replica;
-        cur_page->replica = NULL;  
+        cur_page->replica = NULL;
         smp_wmb();
-        
+
         pt = page_ptdesc(cur_page);
         pagetable_dtor(pt);
         __free_page(cur_page);
-        
+
         cur_page = next_page;
-        
-        if (++iterations >= MAX_NUMNODES) {
-            pr_err("MITOSIS CRITICAL: release_%s - infinite loop in replica chain!\n", level_name);
-            local_irq_restore(flags);
+
+        if (++iterations >= MAX_NUMNODES)
             BUG();
-        }
     }
 
     local_irq_restore(flags);
 }
 
-
-
-
 void pgtable_repl_release_p4d(unsigned long pfn)
 {
     struct page *page, *cur_page, *next_page;
     int iterations = 0;
-    const char *level_name = "p4d";
     unsigned long flags;
 
-    
     if (!pgtable_l5_enabled())
         return;
 
@@ -3030,37 +2926,31 @@ void pgtable_repl_release_p4d(unsigned long pfn)
 
     page = pfn_to_page(pfn);
     if (!page)
-        return;
+        BUG();
 
-    
     local_irq_save(flags);
 
-    
     cur_page = xchg(&page->replica, NULL);
     if (!cur_page) {
         local_irq_restore(flags);
         return;
     }
 
-    
     while (cur_page && cur_page != page) {
         struct ptdesc *pt;
-        
+
         next_page = cur_page->replica;
-        cur_page->replica = NULL;  
+        cur_page->replica = NULL;
         smp_wmb();
-        
+
         pt = page_ptdesc(cur_page);
         pagetable_dtor(pt);
         __free_page(cur_page);
-        
+
         cur_page = next_page;
-        
-        if (++iterations >= MAX_NUMNODES) {
-            pr_err("MITOSIS CRITICAL: release_%s - infinite loop in replica chain!\n", level_name);
-            local_irq_restore(flags);
+
+        if (++iterations >= MAX_NUMNODES)
             BUG();
-        }
     }
 
     local_irq_restore(flags);
