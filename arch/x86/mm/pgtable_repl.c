@@ -738,14 +738,40 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
     }
 
     parent_page = virt_to_page(p4dp);
-    repl = READ_ONCE(parent_page->replica);
-
-    /* Create parent replicas on-demand if missing */
-    if (!repl) {
-        pgtable_repl_alloc_p4d(mm, page_to_pfn(parent_page));
+    
+    /*
+     * Handle 4-level vs 5-level paging:
+     * - In 4-level paging, P4D is folded into PGD, so p4dp points into the PGD page
+     * - In 5-level paging, P4D is a separate level
+     */
+    if (!pgtable_l5_enabled()) {
+        /* 4-level paging: p4dp is in the PGD page */
+        void *parent_addr = page_address(parent_page);
+        
+        /* Check if this is our mm's PGD or a different mm's (e.g., during exec) */
+        if (parent_addr != (void *)mm->pgd) {
+            /* Operating on a different mm's page table - use native.
+             * This is valid during exec when current->mm has replication
+             * but we're building page tables for the new mm. */
+            native_set_p4d(p4dp, p4dval);
+            return;
+        }
+        
+        /* This IS our PGD - it MUST have replicas */
         repl = READ_ONCE(parent_page->replica);
         if (!repl)
             BUG();
+    } else {
+        /* 5-level paging: p4dp is in a real P4D page */
+        repl = READ_ONCE(parent_page->replica);
+
+        /* Create parent replicas on-demand if missing */
+        if (!repl) {
+            pgtable_repl_alloc_p4d(mm, page_to_pfn(parent_page));
+            repl = READ_ONCE(parent_page->replica);
+            if (!repl)
+                BUG();
+        }
     }
 
     /* Track replicated set operation */
@@ -846,9 +872,25 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
     }
 
     parent_page = virt_to_page(pgdp);
+    
+    /*
+     * Check if this is our mm's PGD or a different mm's (e.g., during exec).
+     * During exec, current->mm has replication enabled but we may be
+     * building page tables for the NEW mm which doesn't have replication yet.
+     */
+    {
+        void *parent_addr = page_address(parent_page);
+        
+        if (parent_addr != (void *)mm->pgd) {
+            /* Operating on a different mm's page table - use native.
+             * This is valid during exec. */
+            native_set_pgd(pgdp, pgdval);
+            return;
+        }
+    }
+    
+    /* This IS our PGD - it MUST have replicas */
     repl = READ_ONCE(parent_page->replica);
-
-    /* PGD must have replicas if replication is enabled */
     if (!repl)
         BUG();
 
@@ -927,6 +969,7 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
 
     smp_wmb();
 }
+
 
 pte_t pgtable_repl_get_pte(pte_t *ptep)
 {
