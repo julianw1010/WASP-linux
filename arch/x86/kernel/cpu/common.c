@@ -659,8 +659,8 @@ static void filter_cpuid_features(struct cpuinfo_x86 *c, bool warn)
 		 * signs here...
 		 */
 		if (!((s32)df->level < 0 ?
-		     (u32)df->level > (u32)c->extended_cpuid_level :
-		     (s32)df->level > (s32)c->cpuid_level))
+		      (u32)df->level > (u32)c->extended_cpuid_level :
+		      (s32)df->level > (s32)c->cpuid_level))
 			continue;
 
 		clear_cpu_cap(c, df->feature);
@@ -670,6 +670,24 @@ static void filter_cpuid_features(struct cpuinfo_x86 *c, bool warn)
 		pr_warn("CPU: CPU feature %s disabled, no CPUID level 0x%x\n",
 			x86_cap_flags[df->feature], df->level);
 	}
+
+#ifdef CONFIG_PGTABLE_REPLICATION
+    /*
+     * MITOSIS: Disable PCID/INVPCID/INVLPGB early.
+     * INVLPGB uses ASIDs (PCIDs) for its operation, so it must
+     * also be disabled when PCID support is removed.
+     */
+    if (c == &boot_cpu_data) {
+        pr_notice("MITOSIS: filter_cpuid_features disabling PCID/INVPCID/INVLPGB\n");
+        setup_clear_cpu_cap(X86_FEATURE_PCID);
+        setup_clear_cpu_cap(X86_FEATURE_INVPCID);
+        setup_clear_cpu_cap(X86_FEATURE_INVLPGB);
+    }
+    clear_cpu_cap(c, X86_FEATURE_PCID);
+    clear_cpu_cap(c, X86_FEATURE_INVPCID);
+    clear_cpu_cap(c, X86_FEATURE_INVLPGB);
+#endif
+
 }
 
 /*
