@@ -51,7 +51,7 @@ static double cpu_ghz = 2.8;
 static double THR_MAR = 10.0 * 1000000.0;
 static double THR_DTLB = 0.01;
 
-#define MAX_NUMA_NODES             8
+#define MAX_NUMA_NODES             16
 #define MAX_EXCLUDED_NAMES         32
 #define MAX_NAME_LEN               64
 
@@ -1305,11 +1305,6 @@ int main(int argc, char *argv[]) {
     int parse_result = parse_args(argc, argv);
     if (parse_result <= 0) {
         return parse_result == 0 ? 0 : 1;
-    }
-    
-    if (geteuid() != 0) {
-        fprintf(stderr, "Error: WASP daemon must run as root\n");
-        return 1;
     }
     
     daemon_pid = getpid();
