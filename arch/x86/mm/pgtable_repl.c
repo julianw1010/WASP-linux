@@ -463,12 +463,15 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     pte_page = virt_to_page(ptep);
     repl = READ_ONCE(pte_page->replica);
 
-    /* Create replicas on-demand if missing */
+    /*
+     * If no replicas exist, this page likely belongs to a different mm
+     * (e.g., bprm->mm during exec). Don't try to create replicas here -
+     * they should be created via alloc callbacks for pages belonging to
+     * the correct mm. Use native path.
+     */
     if (!repl) {
-        pgtable_repl_alloc_pte(mm, page_to_pfn(pte_page));
-        repl = READ_ONCE(pte_page->replica);
-        if (!repl)
-            BUG();
+        native_set_pte(ptep, pteval);
+        return;
     }
 
     /* Track replicated set operation */
@@ -524,12 +527,13 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
     parent_page = virt_to_page(pmdp);
     repl = READ_ONCE(parent_page->replica);
 
-    /* Create parent replicas on-demand if missing */
+    /*
+     * If no replicas exist, this page likely belongs to a different mm.
+     * Use native path.
+     */
     if (!repl) {
-        pgtable_repl_alloc_pmd(mm, page_to_pfn(parent_page));
-        repl = READ_ONCE(parent_page->replica);
-        if (!repl)
-            BUG();
+        native_set_pmd(pmdp, pmdval);
+        return;
     }
 
     /* Track replicated set operation */
@@ -545,12 +549,9 @@ void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
         if (!child_base_page)
             BUG();
 
-        /* Create child replicas on-demand if missing */
-        if (!READ_ONCE(child_base_page->replica)) {
-            pgtable_repl_alloc_pte(mm, page_to_pfn(child_base_page));
-            if (!READ_ONCE(child_base_page->replica))
-                BUG();
-        }
+        /* Child must have replicas if parent does */
+        if (!READ_ONCE(child_base_page->replica))
+            BUG();
     }
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
@@ -632,12 +633,13 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
     parent_page = virt_to_page(pudp);
     repl = READ_ONCE(parent_page->replica);
 
-    /* Create parent replicas on-demand if missing */
+    /*
+     * If no replicas exist, this page likely belongs to a different mm.
+     * Use native path.
+     */
     if (!repl) {
-        pgtable_repl_alloc_pud(mm, page_to_pfn(parent_page));
-        repl = READ_ONCE(parent_page->replica);
-        if (!repl)
-            BUG();
+        native_set_pud(pudp, pudval);
+        return;
     }
 
     /* Track replicated set operation */
@@ -653,12 +655,9 @@ void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
         if (!child_base_page)
             BUG();
 
-        /* Create child replicas on-demand if missing */
-        if (!READ_ONCE(child_base_page->replica)) {
-            pgtable_repl_alloc_pmd(mm, page_to_pfn(child_base_page));
-            if (!READ_ONCE(child_base_page->replica))
-                BUG();
-        }
+        /* Child must have replicas if parent does */
+        if (!READ_ONCE(child_base_page->replica))
+            BUG();
     }
 
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
@@ -750,9 +749,7 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         
         /* Check if this is our mm's PGD or a different mm's (e.g., during exec) */
         if (parent_addr != (void *)mm->pgd) {
-            /* Operating on a different mm's page table - use native.
-             * This is valid during exec when current->mm has replication
-             * but we're building page tables for the new mm. */
+            /* Operating on a different mm's page table - use native */
             native_set_p4d(p4dp, p4dval);
             return;
         }
@@ -765,12 +762,13 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         /* 5-level paging: p4dp is in a real P4D page */
         repl = READ_ONCE(parent_page->replica);
 
-        /* Create parent replicas on-demand if missing */
+        /*
+         * If no replicas exist, this page likely belongs to a different mm.
+         * Use native path.
+         */
         if (!repl) {
-            pgtable_repl_alloc_p4d(mm, page_to_pfn(parent_page));
-            repl = READ_ONCE(parent_page->replica);
-            if (!repl)
-                BUG();
+            native_set_p4d(p4dp, p4dval);
+            return;
         }
     }
 
@@ -787,12 +785,9 @@ void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
         if (!child_base_page)
             BUG();
 
-        /* Create child replicas on-demand if missing */
-        if (!READ_ONCE(child_base_page->replica)) {
-            pgtable_repl_alloc_pud(mm, page_to_pfn(child_base_page));
-            if (!READ_ONCE(child_base_page->replica))
-                BUG();
-        }
+        /* Child must have replicas if parent does */
+        if (!READ_ONCE(child_base_page->replica))
+            BUG();
     }
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
@@ -882,8 +877,7 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         void *parent_addr = page_address(parent_page);
         
         if (parent_addr != (void *)mm->pgd) {
-            /* Operating on a different mm's page table - use native.
-             * This is valid during exec. */
+            /* Operating on a different mm's page table - use native */
             native_set_pgd(pgdp, pgdval);
             return;
         }
@@ -907,16 +901,9 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
         if (!child_base_page)
             BUG();
 
-        /* Create child replicas on-demand if missing */
-        if (!READ_ONCE(child_base_page->replica)) {
-            if (pgtable_l5_enabled()) {
-                pgtable_repl_alloc_p4d(mm, page_to_pfn(child_base_page));
-            } else {
-                pgtable_repl_alloc_pud(mm, page_to_pfn(child_base_page));
-            }
-            if (!READ_ONCE(child_base_page->replica))
-                BUG();
-        }
+        /* Child must have replicas if parent does */
+        if (!READ_ONCE(child_base_page->replica))
+            BUG();
     }
 
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
@@ -969,7 +956,6 @@ void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
 
     smp_wmb();
 }
-
 
 pte_t pgtable_repl_get_pte(pte_t *ptep)
 {
