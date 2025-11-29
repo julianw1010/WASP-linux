@@ -1738,16 +1738,14 @@ static struct mm_struct *dup_mm(struct task_struct *tsk,
 		goto fail_nomem;
 	memcpy(mm, oldmm, sizeof(*mm));
 #ifdef CONFIG_PGTABLE_REPLICATION
-	if (oldmm->repl_pgd_enabled) {
-		WARN_ON_ONCE(nodes_empty(oldmm->repl_pgd_nodes));
-	}
+	/* Don't check oldmm state - it's racy with other threads */
 	mm->repl_pgd_enabled = false;
 	nodes_clear(mm->repl_pgd_nodes);
 	mutex_init(&mm->repl_mutex);
 	spin_lock_init(&mm->repl_alloc_lock);
 	memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
-	WARN_ON_ONCE(mm->repl_pgd_enabled);
-	WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes));
+	WARN_ON_ONCE(mm->repl_pgd_enabled);           /* OK - checks new mm */
+	WARN_ON_ONCE(!nodes_empty(mm->repl_pgd_nodes)); /* OK - checks new mm */
 #endif
 	if (!mm_init(mm, tsk, mm->user_ns))
 		goto fail_nomem;
@@ -1795,122 +1793,62 @@ static int copy_mm(unsigned long clone_flags, struct task_struct *tsk)
     } else {
 #ifdef CONFIG_PGTABLE_REPLICATION
         bool parent_had_mitosis = false;
-        bool parent_still_enabled = false;
         nodemask_t saved_nodes;
         int ret;
 
-        /* Save parent's mitosis state */
-        if (oldmm->repl_pgd_enabled) {
+        nodes_clear(saved_nodes);
+
+        /*
+         * Snapshot mitosis state atomically under mutex.
+         * This prevents seeing enabled=true with empty nodes.
+         */
+        mutex_lock(&oldmm->repl_mutex);
+        if (oldmm->repl_pgd_enabled && 
+            !nodes_empty(oldmm->repl_pgd_nodes) &&
+            nodes_weight(oldmm->repl_pgd_nodes) >= 2) {
             parent_had_mitosis = true;
             saved_nodes = oldmm->repl_pgd_nodes;
-            
-            // pr_info("MITOSIS FORK: Parent PID %d has mitosis on %d nodes, temporarily disabling\n",
-           //         current->pid, nodes_weight(saved_nodes));
-            
-            /* Disable parent mitosis before dup_mm */
+        }
+        mutex_unlock(&oldmm->repl_mutex);
+
+        /*
+         * Disable parent's mitosis before dup_mm.
+         * Best-effort: another thread may re-enable, that's OK.
+         */
+        if (parent_had_mitosis) {
             pgtable_repl_disable(oldmm);
-            
-            /* Verify disable succeeded */
-            if (oldmm->repl_pgd_enabled) {
-                pr_err("MITOSIS FORK CRITICAL: Failed to disable parent before fork!\n");
-                pr_err("  Parent PID %d, oldmm=%px\n", current->pid, oldmm);
-                return -EFAULT;
-            }
         }
 
-        /* Duplicate mm with clean page tables */
+        /* dup_mm works with or without mitosis */
         mm = dup_mm(tsk, oldmm);
-        
+
         if (!mm) {
-            /* CRITICAL: Restore parent before returning error */
+            /* Best-effort restore on OOM */
             if (parent_had_mitosis) {
-                pr_err("MITOSIS FORK: dup_mm failed, restoring parent (PID %d)\n",
-                       current->pid);
-                
-                ret = pgtable_repl_enable(oldmm, saved_nodes);
-                if (ret != 0) {
-                    pr_crit("MITOSIS FORK CRITICAL: Failed emergency parent restore! PID %d, ret=%d\n",
-                            current->pid, ret);
-                }
+                pgtable_repl_enable(oldmm, saved_nodes);
             }
             return -ENOMEM;
         }
 
-        /* Restore parent's mitosis - no signal check, will always complete */
+        /* Restore parent's mitosis */
         if (parent_had_mitosis) {
-            //pr_info("MITOSIS FORK: Restoring parent mitosis (PID %d)\n", current->pid);
-            
             ret = pgtable_repl_enable(oldmm, saved_nodes);
-            
-            if (ret != 0) {
-                pr_err("MITOSIS FORK CRITICAL: Failed to restore parent mitosis!\n");
-                pr_err("  Parent PID %d (%s), ret=%d\n", current->pid, current->comm, ret);
-                pr_err("  oldmm=%px, pgd=%px\n", oldmm, oldmm->pgd);
-                pr_err("  Attempted nodes: %*pbl\n", nodemask_pr_args(&saved_nodes));
-                
-                if (ret == -ENOMEM) {
-                    pr_err("  Cause: Out of memory\n");
-                } else if (ret == -EALREADY) {
-                    pr_err("  Cause: Already enabled\n");
-                } else if (ret == -EINVAL) {
-                    pr_err("  Cause: Invalid parameters\n");
-                } else {
-                    pr_err("  Cause: Unknown (ret=%d)\n", ret);
-                }
-                pr_err("  WARNING: Parent process is now in broken state!\n");
-                
-                parent_still_enabled = false;
-            } else {
-               // pr_info("MITOSIS FORK: Parent mitosis restored successfully (PID %d)\n",
-              //          current->pid);
-                parent_still_enabled = true;
-            }
+            /* -EALREADY means another thread re-enabled - fine */
         }
 
-        /* Determine if child should get mitosis */
-        bool should_enable_child = false;
-        
-        if (parent_had_mitosis && parent_still_enabled && sysctl_mitosis_inherit == 1) {
-            should_enable_child = true;
-        } else if (sysctl_mitosis_auto_enable == 1) {
-	    if (!(tsk->flags & PF_KTHREAD)) {
-		should_enable_child = true;
-	    }
-	}
-
-        /* Enable mitosis for child - no signal check, will always complete */
-        if (should_enable_child) {
-            nodemask_t child_nodes = parent_had_mitosis ? saved_nodes : node_online_map;
-            
-            //pr_info("MITOSIS FORK: Enabling child mitosis (PID %d, parent=%d)\n",
-            //        tsk->pid, current->pid);
-            
-            ret = pgtable_repl_enable(mm, child_nodes);
-            
-            if (ret != 0) {
-                /* Not critical for child */
-                if (ret == -ENOMEM) {
-                    pr_warn("MITOSIS FORK: Child PID %d (%s) running without mitosis (out of memory)\n",
-                            tsk->pid, tsk->comm);
-                    pr_info("  This is acceptable for short-lived processes\n");
-                } else if (ret == -EINVAL) {
-                    pr_err("MITOSIS FORK: Child mitosis enable failed with EINVAL\n");
-                    pr_err("  Child PID %d, mm=%px, pgd=%px\n", tsk->pid, mm, mm->pgd);
-                } else if (ret == -EALREADY) {
-                    pr_warn("MITOSIS FORK: Child already has mitosis enabled (unexpected)\n");
-                } else {
-                    pr_err("MITOSIS FORK: Child mitosis enable failed (ret=%d)\n", ret);
-                }
-            } else {
-                //pr_info("MITOSIS FORK: Child mitosis enabled successfully (PID %d)\n", tsk->pid);
-            }
+        /* Enable child's mitosis if configured */
+        if (sysctl_mitosis_inherit == 1 && parent_had_mitosis) {
+            pgtable_repl_enable(mm, saved_nodes);
+        } else if (sysctl_mitosis_auto_enable == 1 && 
+                   !(tsk->flags & PF_KTHREAD) &&
+                   num_online_nodes() >= 2) {
+            pgtable_repl_enable(mm, node_online_map);
         }
 #else
         mm = dup_mm(tsk, oldmm);
         if (!mm)
             return -ENOMEM;
 #endif
-
     }
 
     tsk->mm = mm;

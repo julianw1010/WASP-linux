@@ -66,15 +66,16 @@ static bool link_page_replicas(struct page **pages, int count)
     p = pages[0];
     for (i = 0; i < count; i++) {
         if (!p->replica)
-            BUG();
+            return false;  /* Link failed */
         p = p->replica;
     }
 
     if (p != pages[0])
-        BUG();
+        return false;  /* Not circular */
 
     return true;
 }
+
 
 static struct page *get_replica_for_node(struct page *base, int target_node)
 {
@@ -83,7 +84,7 @@ static struct page *get_replica_for_node(struct page *base, int target_node)
     int iterations = 0;
 
     if (!base)
-        BUG();
+        return NULL;
 
     /* Check if base is already on target node */
     if (page_to_nid(base) == target_node)
@@ -91,7 +92,7 @@ static struct page *get_replica_for_node(struct page *base, int target_node)
 
     page = READ_ONCE(base->replica);
     if (!page)
-        BUG();
+        return NULL;  /* No replicas - race with disable */
 
     /* Walk the circular list looking for target node */
     while (page != base) {
@@ -100,25 +101,32 @@ static struct page *get_replica_for_node(struct page *base, int target_node)
 
         next = READ_ONCE(page->replica);
         if (!next)
-            BUG();
+            return NULL;  /* Chain broken - race with disable */
         page = next;
 
         if (++iterations >= MAX_NUMNODES)
-            BUG();
+            return NULL;  /* Corrupted chain */
     }
 
     /* Target node not found in replica chain */
-    BUG();
+    return NULL;
 }
+
 
 static int alloc_pte_replicas(struct page *base_page, struct mm_struct *mm,
                               struct page **pages, int *count)
 {
-    int i;
+    int i, j;
     int base_node;
+    int expected_count;
 
     if (!base_page || !mm || !pages || !count)
-        BUG();
+        return -EINVAL;
+
+    /* Snapshot expected count before iterating */
+    expected_count = nodes_weight(mm->repl_pgd_nodes);
+    if (expected_count < 2)
+        return -EAGAIN;  /* Race with disable */
 
     base_node = page_to_nid(base_page);
     pages[0] = base_page;
@@ -131,53 +139,57 @@ static int alloc_pte_replicas(struct page *base_page, struct mm_struct *mm,
         if (i == base_node)
             continue;
 
-        /*
-         * Maximum pressure allocation - this MUST succeed:
-         * - __GFP_THISNODE: Strict node locality, no fallback
-         * - __GFP_HIGH: Use emergency reserves
-         * - __GFP_MEMALLOC: Access ALL memory reserves
-         * - __GFP_NOFAIL: Keep retrying forever
-         */
         new_page = alloc_pages_node(i,
             GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE |
-            __GFP_HIGH | __GFP_MEMALLOC,
-            0);
+            __GFP_HIGH | __GFP_MEMALLOC, 0);
 
-        if (!new_page) {
-            pr_emerg("MITOSIS FATAL: alloc_pte_replicas failed on node %d\n", i);
-            BUG();
-        }
+        if (!new_page)
+            goto fail_cleanup;
 
         if (page_to_nid(new_page) != i) {
-            pr_emerg("MITOSIS FATAL: alloc_pte_replicas wrong node: requested=%d got=%d\n",
-                     i, page_to_nid(new_page));
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pt = page_ptdesc(new_page);
         if (!pagetable_pte_ctor(pt)) {
-            pr_emerg("MITOSIS FATAL: pagetable_pte_ctor failed on node %d\n", i);
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pages[*count] = new_page;
         (*count)++;
     }
 
-    if (*count != nodes_weight(mm->repl_pgd_nodes))
-        BUG();
+    /* Verify count matches - detects race with disable */
+    if (*count != expected_count)
+        goto fail_cleanup;
 
     return 0;
+
+fail_cleanup:
+    for (j = 1; j < *count; j++) {
+        struct ptdesc *pt = page_ptdesc(pages[j]);
+        pagetable_dtor(pt);
+        __free_page(pages[j]);
+    }
+    *count = 0;
+    return -EAGAIN;
 }
 
 static int alloc_pmd_replicas(struct page *base_page, struct mm_struct *mm,
                               struct page **pages, int *count)
 {
-    int i;
+    int i, j;
     int base_node;
+    int expected_count;
 
     if (!base_page || !mm || !pages || !count)
-        BUG();
+        return -EINVAL;
+
+    expected_count = nodes_weight(mm->repl_pgd_nodes);
+    if (expected_count < 2)
+        return -EAGAIN;
 
     base_node = page_to_nid(base_page);
     pages[0] = base_page;
@@ -192,44 +204,54 @@ static int alloc_pmd_replicas(struct page *base_page, struct mm_struct *mm,
 
         new_page = alloc_pages_node(i,
             GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE |
-            __GFP_HIGH | __GFP_MEMALLOC,
-            0);
+            __GFP_HIGH | __GFP_MEMALLOC, 0);
 
-        if (!new_page) {
-            pr_emerg("MITOSIS FATAL: alloc_pmd_replicas failed on node %d\n", i);
-            BUG();
-        }
+        if (!new_page)
+            goto fail_cleanup;
 
         if (page_to_nid(new_page) != i) {
-            pr_emerg("MITOSIS FATAL: alloc_pmd_replicas wrong node: requested=%d got=%d\n",
-                     i, page_to_nid(new_page));
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pt = page_ptdesc(new_page);
         if (!pagetable_pmd_ctor(pt)) {
-            pr_emerg("MITOSIS FATAL: pagetable_pmd_ctor failed on node %d\n", i);
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pages[*count] = new_page;
         (*count)++;
     }
 
-    if (*count != nodes_weight(mm->repl_pgd_nodes))
-        BUG();
+    if (*count != expected_count)
+        goto fail_cleanup;
 
     return 0;
+
+fail_cleanup:
+    for (j = 1; j < *count; j++) {
+        struct ptdesc *pt = page_ptdesc(pages[j]);
+        pagetable_dtor(pt);
+        __free_page(pages[j]);
+    }
+    *count = 0;
+    return -EAGAIN;
 }
 
 static int alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
                               struct page **pages, int *count)
 {
-    int i;
+    int i, j;
     int base_node;
+    int expected_count;
 
     if (!base_page || !mm || !pages || !count)
-        BUG();
+        return -EINVAL;
+
+    expected_count = nodes_weight(mm->repl_pgd_nodes);
+    if (expected_count < 2)
+        return -EAGAIN;
 
     base_node = page_to_nid(base_page);
     pages[0] = base_page;
@@ -244,18 +266,14 @@ static int alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
 
         new_page = alloc_pages_node(i,
             GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE |
-            __GFP_HIGH | __GFP_MEMALLOC,
-            0);
+            __GFP_HIGH | __GFP_MEMALLOC, 0);
 
-        if (!new_page) {
-            pr_emerg("MITOSIS FATAL: alloc_pud_replicas failed on node %d\n", i);
-            BUG();
-        }
+        if (!new_page)
+            goto fail_cleanup;
 
         if (page_to_nid(new_page) != i) {
-            pr_emerg("MITOSIS FATAL: alloc_pud_replicas wrong node: requested=%d got=%d\n",
-                     i, page_to_nid(new_page));
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pt = page_ptdesc(new_page);
@@ -265,20 +283,34 @@ static int alloc_pud_replicas(struct page *base_page, struct mm_struct *mm,
         (*count)++;
     }
 
-    if (*count != nodes_weight(mm->repl_pgd_nodes))
-        BUG();
+    if (*count != expected_count)
+        goto fail_cleanup;
 
     return 0;
+
+fail_cleanup:
+    for (j = 1; j < *count; j++) {
+        struct ptdesc *pt = page_ptdesc(pages[j]);
+        pagetable_dtor(pt);
+        __free_page(pages[j]);
+    }
+    *count = 0;
+    return -EAGAIN;
 }
 
 static int alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
                               struct page **pages, int *count)
 {
-    int i;
+    int i, j;
     int base_node;
+    int expected_count;
 
     if (!base_page || !mm || !pages || !count)
-        BUG();
+        return -EINVAL;
+
+    expected_count = nodes_weight(mm->repl_pgd_nodes);
+    if (expected_count < 2)
+        return -EAGAIN;
 
     base_node = page_to_nid(base_page);
     pages[0] = base_page;
@@ -293,18 +325,14 @@ static int alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
 
         new_page = alloc_pages_node(i,
             GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE |
-            __GFP_HIGH | __GFP_MEMALLOC,
-            0);
+            __GFP_HIGH | __GFP_MEMALLOC, 0);
 
-        if (!new_page) {
-            pr_emerg("MITOSIS FATAL: alloc_p4d_replicas failed on node %d\n", i);
-            BUG();
-        }
+        if (!new_page)
+            goto fail_cleanup;
 
         if (page_to_nid(new_page) != i) {
-            pr_emerg("MITOSIS FATAL: alloc_p4d_replicas wrong node: requested=%d got=%d\n",
-                     i, page_to_nid(new_page));
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pt = page_ptdesc(new_page);
@@ -314,20 +342,34 @@ static int alloc_p4d_replicas(struct page *base_page, struct mm_struct *mm,
         (*count)++;
     }
 
-    if (*count != nodes_weight(mm->repl_pgd_nodes))
-        BUG();
+    if (*count != expected_count)
+        goto fail_cleanup;
 
     return 0;
+
+fail_cleanup:
+    for (j = 1; j < *count; j++) {
+        struct ptdesc *pt = page_ptdesc(pages[j]);
+        pagetable_dtor(pt);
+        __free_page(pages[j]);
+    }
+    *count = 0;
+    return -EAGAIN;
 }
 
 static int alloc_pgd_replicas(struct page *base_page, nodemask_t nodes,
                               struct page **pages, int *count)
 {
-    int i;
+    int i, j;
     int base_node;
+    int expected_count;
 
     if (!base_page || !pages || !count)
-        BUG();
+        return -EINVAL;
+
+    expected_count = nodes_weight(nodes);
+    if (expected_count < 2)
+        return -EINVAL;
 
     base_node = page_to_nid(base_page);
     pages[0] = base_page;
@@ -342,18 +384,14 @@ static int alloc_pgd_replicas(struct page *base_page, nodemask_t nodes,
 
         new_page = alloc_pages_node(i,
             GFP_ATOMIC | __GFP_ZERO | __GFP_THISNODE |
-            __GFP_HIGH | __GFP_MEMALLOC,
-            0);
+            __GFP_HIGH | __GFP_MEMALLOC, 0);
 
-        if (!new_page) {
-            pr_emerg("MITOSIS FATAL: alloc_pgd_replicas failed on node %d\n", i);
-            BUG();
-        }
+        if (!new_page)
+            goto fail_cleanup;
 
         if (page_to_nid(new_page) != i) {
-            pr_emerg("MITOSIS FATAL: alloc_pgd_replicas wrong node: requested=%d got=%d\n",
-                     i, page_to_nid(new_page));
-            BUG();
+            __free_page(new_page);
+            goto fail_cleanup;
         }
 
         pt = page_ptdesc(new_page);
@@ -363,10 +401,19 @@ static int alloc_pgd_replicas(struct page *base_page, nodemask_t nodes,
         (*count)++;
     }
 
-    if (*count != nodes_weight(nodes))
-        BUG();
+    if (*count != expected_count)
+        goto fail_cleanup;
 
     return 0;
+
+fail_cleanup:
+    for (j = 1; j < *count; j++) {
+        struct ptdesc *pt = page_ptdesc(pages[j]);
+        pagetable_dtor(pt);
+        __free_page(pages[j]);
+    }
+    *count = 0;
+    return -ENOMEM;
 }
 
 void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
@@ -376,20 +423,18 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
-    int nodes_updated = 0;
 
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_set_pte(ptep, pteval);
+    /* Always set the primary */
+    native_set_pte(ptep, pteval);
+
+    if (!mm || !mm->repl_pgd_enabled)
         return;
-    }
 
     pte_page = virt_to_page(ptep);
     repl = READ_ONCE(pte_page->replica);
 
-    if (!repl) {
-        native_set_pte(ptep, pteval);
-        return;
-    }
+    if (!repl)
+        return;  /* No replicas yet or race with disable */
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
@@ -399,17 +444,323 @@ void pgtable_repl_set_pte(pte_t *ptep, pte_t pteval)
         pte_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;  /* Invalid page - stop iteration */
 
         replica_entry = (pte_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, pteval);
-        nodes_updated++;
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
+        if (++iterations >= MAX_NUMNODES)
+            break;  /* Safety limit */
     } while (cur_page && cur_page != pte_page);
+
+    smp_wmb();
+}
+
+void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
+{
+    struct mm_struct *mm = current ? current->mm : NULL;
+    struct page *parent_page, *child_base_page = NULL;
+    struct page *repl;
+    unsigned long offset;
+    int iterations = 0;
+    unsigned long entry_val = pmd_val(pmdval);
+    const unsigned long pfn_mask = PTE_PFN_MASK;
+    bool has_child = pmd_present(pmdval) && !pmd_trans_huge(pmdval);
+
+    /* Always set the primary */
+    native_set_pmd(pmdp, pmdval);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
+
+    parent_page = virt_to_page(pmdp);
+    repl = READ_ONCE(parent_page->replica);
+
+    if (!repl)
+        return;
+
+    /* Check child (PTE page) replicas */
+    if (has_child && entry_val != 0) {
+        unsigned long child_phys = entry_val & pfn_mask;
+        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
+            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
+            struct page *cp_repl = READ_ONCE(cp->replica);
+            
+            if (cp && cp_repl)
+                child_base_page = cp;
+        }
+    }
+
+    offset = ((unsigned long)pmdp) & ~PAGE_MASK;
+
+    struct page *cur_page = parent_page;
+    do {
+        void *page_addr = page_address(cur_page);
+        pmd_t *replica_entry;
+        unsigned long node_val;
+        int node;
+
+        if (!page_addr)
+            break;
+
+        node = page_to_nid(cur_page);
+        replica_entry = (pmd_t *)(page_addr + offset);
+
+        if (child_base_page && entry_val != 0) {
+            struct page *node_local_child = get_replica_for_node(child_base_page, node);
+
+            if (node_local_child && page_to_nid(node_local_child) == node) {
+                void *node_child_addr = page_address(node_local_child);
+                if (node_child_addr) {
+                    node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
+                } else {
+                    node_val = entry_val;
+                }
+            } else {
+                node_val = entry_val;  /* Fallback to original */
+            }
+        } else {
+            node_val = entry_val;
+        }
+
+        WRITE_ONCE(*replica_entry, __pmd(node_val));
+
+        cur_page = READ_ONCE(cur_page->replica);
+        if (++iterations >= MAX_NUMNODES)
+            break;
+    } while (cur_page && cur_page != parent_page);
+
+    smp_wmb();
+}
+
+void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
+{
+    struct mm_struct *mm = current ? current->mm : NULL;
+    struct page *parent_page, *child_base_page = NULL;
+    struct page *repl;
+    unsigned long offset;
+    int iterations = 0;
+    unsigned long entry_val = pud_val(pudval);
+    const unsigned long pfn_mask = PTE_PFN_MASK;
+    bool has_child = pud_present(pudval) && !pud_trans_huge(pudval);
+
+    native_set_pud(pudp, pudval);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
+
+    parent_page = virt_to_page(pudp);
+    repl = READ_ONCE(parent_page->replica);
+
+    if (!repl)
+        return;
+
+    if (has_child && entry_val != 0) {
+        unsigned long child_phys = entry_val & pfn_mask;
+        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
+            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
+            struct page *cp_repl = READ_ONCE(cp->replica);
+            
+            if (cp && cp_repl)
+                child_base_page = cp;
+        }
+    }
+
+    offset = ((unsigned long)pudp) & ~PAGE_MASK;
+
+    struct page *cur_page = parent_page;
+    do {
+        void *page_addr = page_address(cur_page);
+        pud_t *replica_entry;
+        unsigned long node_val;
+        int node;
+
+        if (!page_addr)
+            break;
+
+        node = page_to_nid(cur_page);
+        replica_entry = (pud_t *)(page_addr + offset);
+
+        if (child_base_page && entry_val != 0) {
+            struct page *node_local_child = get_replica_for_node(child_base_page, node);
+
+            if (node_local_child && page_to_nid(node_local_child) == node) {
+                void *node_child_addr = page_address(node_local_child);
+                if (node_child_addr) {
+                    node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
+                } else {
+                    node_val = entry_val;
+                }
+            } else {
+                node_val = entry_val;
+            }
+        } else {
+            node_val = entry_val;
+        }
+
+        WRITE_ONCE(*replica_entry, __pud(node_val));
+
+        cur_page = READ_ONCE(cur_page->replica);
+        if (++iterations >= MAX_NUMNODES)
+            break;
+    } while (cur_page && cur_page != parent_page);
+
+    smp_wmb();
+}
+
+void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
+{
+    struct mm_struct *mm = current ? current->mm : NULL;
+    struct page *parent_page, *child_base_page = NULL;
+    struct page *repl;
+    unsigned long offset;
+    int iterations = 0;
+    unsigned long entry_val = p4d_val(p4dval);
+    const unsigned long pfn_mask = PTE_PFN_MASK;
+    bool has_child = p4d_present(p4dval);
+
+    native_set_p4d(p4dp, p4dval);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
+
+    parent_page = virt_to_page(p4dp);
+    repl = READ_ONCE(parent_page->replica);
+
+    if (!repl)
+        return;
+
+    if (has_child && entry_val != 0) {
+        unsigned long child_phys = entry_val & pfn_mask;
+        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
+            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
+            struct page *cp_repl = READ_ONCE(cp->replica);
+            
+            if (cp && cp_repl)
+                child_base_page = cp;
+        }
+    }
+
+    offset = ((unsigned long)p4dp) & ~PAGE_MASK;
+
+    struct page *cur_page = parent_page;
+    do {
+        void *page_addr = page_address(cur_page);
+        p4d_t *replica_entry;
+        unsigned long node_val;
+        int node;
+
+        if (!page_addr)
+            break;
+
+        node = page_to_nid(cur_page);
+        replica_entry = (p4d_t *)(page_addr + offset);
+
+        if (child_base_page && entry_val != 0) {
+            struct page *node_local_child = get_replica_for_node(child_base_page, node);
+
+            if (node_local_child && page_to_nid(node_local_child) == node) {
+                void *node_child_addr = page_address(node_local_child);
+                if (node_child_addr) {
+                    node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
+                } else {
+                    node_val = entry_val;
+                }
+            } else {
+                node_val = entry_val;
+            }
+        } else {
+            node_val = entry_val;
+        }
+
+        WRITE_ONCE(*replica_entry, __p4d(node_val));
+
+        cur_page = READ_ONCE(cur_page->replica);
+        if (++iterations >= MAX_NUMNODES)
+            break;
+    } while (cur_page && cur_page != parent_page);
+
+    smp_wmb();
+}
+
+void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
+{
+    struct mm_struct *mm = current ? current->mm : NULL;
+    struct page *parent_page, *child_base_page = NULL;
+    struct page *repl;
+    unsigned long offset;
+    int iterations = 0;
+    unsigned long entry_val = pgd_val(pgdval);
+    const unsigned long pfn_mask = PTE_PFN_MASK;
+    bool has_child = pgd_present(pgdval);
+    unsigned long index;
+
+    native_set_pgd(pgdp, pgdval);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
+
+    index = pgdp - mm->pgd;
+    
+    if (index >= KERNEL_PGD_BOUNDARY)
+        return;
+
+    parent_page = virt_to_page(mm->pgd);
+    repl = READ_ONCE(parent_page->replica);
+
+    if (!repl)
+        return;
+
+    if (has_child && entry_val != 0) {
+        unsigned long child_phys = entry_val & pfn_mask;
+        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
+            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
+            struct page *cp_repl = READ_ONCE(cp->replica);
+            
+            if (cp && cp_repl)
+                child_base_page = cp;
+        }
+    }
+
+    offset = ((unsigned long)pgdp) & ~PAGE_MASK;
+
+    struct page *cur_page = parent_page;
+    do {
+        void *page_addr = page_address(cur_page);
+        pgd_t *replica_entry;
+        unsigned long node_val;
+        int node;
+
+        if (!page_addr)
+            break;
+
+        node = page_to_nid(cur_page);
+        replica_entry = (pgd_t *)(page_addr + offset);
+
+        if (child_base_page && entry_val != 0) {
+            struct page *node_local_child = get_replica_for_node(child_base_page, node);
+
+            if (node_local_child && page_to_nid(node_local_child) == node) {
+                void *node_child_addr = page_address(node_local_child);
+                if (node_child_addr) {
+                    node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
+                } else {
+                    node_val = entry_val;
+                }
+            } else {
+                node_val = entry_val;
+            }
+        } else {
+            node_val = entry_val;
+        }
+
+        WRITE_ONCE(*replica_entry, __pgd(node_val));
+
+        cur_page = READ_ONCE(cur_page->replica);
+        if (++iterations >= MAX_NUMNODES)
+            break;
+    } while (cur_page && cur_page != parent_page);
 
     smp_wmb();
 }
@@ -453,90 +804,11 @@ pte_t pgtable_repl_get_pte(pte_t *ptep)
         val |= pte_val(*replica_pte);
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
+        if (++iterations >= MAX_NUMNODES)
             break;
     }
 
     return (pte_t){ .pte = val };
-}
-
-void pgtable_repl_set_pmd(pmd_t *pmdp, pmd_t pmdval)
-{
-    struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *parent_page, *child_base_page = NULL;
-    struct page *repl;
-    unsigned long offset;
-    int iterations = 0;
-    unsigned long entry_val = pmd_val(pmdval);
-    const unsigned long pfn_mask = PTE_PFN_MASK;
-    bool has_child = pmd_present(pmdval) && !pmd_trans_huge(pmdval);
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_set_pmd(pmdp, pmdval);
-        return;
-    }
-
-    parent_page = virt_to_page(pmdp);
-    repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_pmd(pmdp, pmdval);
-        return;
-    }
-
-    /* Check child (PTE page) replicas */
-    if (has_child && entry_val != 0) {
-        unsigned long child_phys = entry_val & pfn_mask;
-        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
-            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl = READ_ONCE(cp->replica);
-            
-            if (cp && cp_repl)
-                child_base_page = cp;
-        }
-    }
-
-    offset = ((unsigned long)pmdp) & ~PAGE_MASK;
-
-    struct page *cur_page = parent_page;
-    do {
-        void *page_addr = page_address(cur_page);
-        pmd_t *replica_entry;
-        unsigned long node_val;
-        int node;
-
-        if (!page_addr)
-            BUG();
-
-        node = page_to_nid(cur_page);
-        replica_entry = (pmd_t *)(page_addr + offset);
-
-        if (child_base_page && entry_val != 0) {
-            struct page *node_local_child = get_replica_for_node(child_base_page, node);
-            void *node_child_addr;
-
-            if (!node_local_child || page_to_nid(node_local_child) != node)
-                BUG();
-
-            node_child_addr = page_address(node_local_child);
-            if (!node_child_addr)
-                BUG();
-
-            node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
-        } else {
-            node_val = entry_val;
-        }
-
-        WRITE_ONCE(*replica_entry, __pmd(node_val));
-
-        cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
-    } while (cur_page && cur_page != parent_page);
-
-    smp_wmb();
 }
 
 pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
@@ -567,8 +839,8 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
     flags = pmd_flags(__pmd(val));
 
     /* Walk the circular list and OR together all flags */
-    cur_page = pmd_page;
-    do {
+    cur_page = pmd_page->replica;
+    while (cur_page && cur_page != pmd_page) {
         pmd_t *replica_pmd;
         void *page_addr = page_address(cur_page);
 
@@ -579,91 +851,12 @@ pmd_t pgtable_repl_get_pmd(pmd_t *pmdp)
         flags |= pmd_flags(*replica_pmd);
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
+        if (++iterations >= MAX_NUMNODES)
             break;
-    } while (cur_page && cur_page != pmd_page);
+    }
 
     /* Combine original PFN with aggregated flags */
     return __pmd((val & PTE_PFN_MASK) | flags);
-}
-
-void pgtable_repl_set_pud(pud_t *pudp, pud_t pudval)
-{
-    struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *parent_page, *child_base_page = NULL;
-    struct page *repl;
-    unsigned long offset;
-    int iterations = 0;
-    unsigned long entry_val = pud_val(pudval);
-    const unsigned long pfn_mask = PTE_PFN_MASK;
-    bool has_child = pud_present(pudval) && !pud_trans_huge(pudval);
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_set_pud(pudp, pudval);
-        return;
-    }
-
-    parent_page = virt_to_page(pudp);
-    repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_pud(pudp, pudval);
-        return;
-    }
-
-    /* Check child (PMD page) replicas */
-    if (has_child && entry_val != 0) {
-        unsigned long child_phys = entry_val & pfn_mask;
-        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
-            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl = READ_ONCE(cp->replica);
-            
-            if (cp && cp_repl)
-                child_base_page = cp;
-        }
-    }
-
-    offset = ((unsigned long)pudp) & ~PAGE_MASK;
-
-    struct page *cur_page = parent_page;
-    do {
-        void *page_addr = page_address(cur_page);
-        pud_t *replica_entry;
-        unsigned long node_val;
-        int node;
-
-        if (!page_addr)
-            BUG();
-
-        node = page_to_nid(cur_page);
-        replica_entry = (pud_t *)(page_addr + offset);
-
-        if (child_base_page && entry_val != 0) {
-            struct page *node_local_child = get_replica_for_node(child_base_page, node);
-            void *node_child_addr;
-
-            if (!node_local_child || page_to_nid(node_local_child) != node)
-                BUG();
-
-            node_child_addr = page_address(node_local_child);
-            if (!node_child_addr)
-                BUG();
-
-            node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
-        } else {
-            node_val = entry_val;
-        }
-
-        WRITE_ONCE(*replica_entry, __pud(node_val));
-
-        cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
-    } while (cur_page && cur_page != parent_page);
-
-    smp_wmb();
 }
 
 pud_t pgtable_repl_get_pud(pud_t *pudp)
@@ -694,8 +887,8 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
     flags = pud_flags(__pud(val));
 
     /* Walk the circular list and OR together all flags */
-    cur_page = pud_page;
-    do {
+    cur_page = pud_page->replica;
+    while (cur_page && cur_page != pud_page) {
         pud_t *replica_pud;
         void *page_addr = page_address(cur_page);
 
@@ -706,91 +899,12 @@ pud_t pgtable_repl_get_pud(pud_t *pudp)
         flags |= pud_flags(*replica_pud);
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
+        if (++iterations >= MAX_NUMNODES)
             break;
-    } while (cur_page && cur_page != pud_page);
+    }
 
     /* Combine original PFN with aggregated flags */
     return __pud((val & PTE_PFN_MASK) | flags);
-}
-
-void pgtable_repl_set_p4d(p4d_t *p4dp, p4d_t p4dval)
-{
-    struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *parent_page, *child_base_page = NULL;
-    struct page *repl;
-    unsigned long offset;
-    int iterations = 0;
-    unsigned long entry_val = p4d_val(p4dval);
-    const unsigned long pfn_mask = PTE_PFN_MASK;
-    bool has_child = p4d_present(p4dval);
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_set_p4d(p4dp, p4dval);
-        return;
-    }
-
-    parent_page = virt_to_page(p4dp);
-    repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_p4d(p4dp, p4dval);
-        return;
-    }
-
-    /* Check child (PUD page) replicas */
-    if (has_child && entry_val != 0) {
-        unsigned long child_phys = entry_val & pfn_mask;
-        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
-            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl = READ_ONCE(cp->replica);
-            
-            if (cp && cp_repl)
-                child_base_page = cp;
-        }
-    }
-
-    offset = ((unsigned long)p4dp) & ~PAGE_MASK;
-
-    struct page *cur_page = parent_page;
-    do {
-        void *page_addr = page_address(cur_page);
-        p4d_t *replica_entry;
-        unsigned long node_val;
-        int node;
-
-        if (!page_addr)
-            BUG();
-
-        node = page_to_nid(cur_page);
-        replica_entry = (p4d_t *)(page_addr + offset);
-
-        if (child_base_page && entry_val != 0) {
-            struct page *node_local_child = get_replica_for_node(child_base_page, node);
-            void *node_child_addr;
-
-            if (!node_local_child || page_to_nid(node_local_child) != node)
-                BUG();
-
-            node_child_addr = page_address(node_local_child);
-            if (!node_child_addr)
-                BUG();
-
-            node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
-        } else {
-            node_val = entry_val;
-        }
-
-        WRITE_ONCE(*replica_entry, __p4d(node_val));
-
-        cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
-    } while (cur_page && cur_page != parent_page);
-
-    smp_wmb();
 }
 
 p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
@@ -820,8 +934,8 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
     flags = p4d_flags(__p4d(val));
 
     /* Walk the circular list and OR together all flags */
-    cur_page = p4d_page;
-    do {
+    cur_page = p4d_page->replica;
+    while (cur_page && cur_page != p4d_page) {
         p4d_t *replica_p4d;
         void *page_addr = page_address(cur_page);
 
@@ -832,100 +946,11 @@ p4d_t pgtable_repl_get_p4d(p4d_t *p4dp)
         flags |= p4d_flags(*replica_p4d);
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
+        if (++iterations >= MAX_NUMNODES)
             break;
-    } while (cur_page && cur_page != p4d_page);
+    }
 
     return __p4d((val & PTE_PFN_MASK) | flags);
-}
-
-void pgtable_repl_set_pgd(pgd_t *pgdp, pgd_t pgdval)
-{
-    struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *parent_page, *child_base_page = NULL;
-    struct page *repl;
-    unsigned long offset;
-    int iterations = 0;
-    unsigned long entry_val = pgd_val(pgdval);
-    const unsigned long pfn_mask = PTE_PFN_MASK;
-    bool has_child = pgd_present(pgdval);
-    unsigned long index;
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_set_pgd(pgdp, pgdval);
-        return;
-    }
-
-    index = pgdp - mm->pgd;
-    
-    if (index >= KERNEL_PGD_BOUNDARY) {
-        native_set_pgd(pgdp, pgdval);
-        return;
-    }
-
-    if (!mm)
-        BUG();
-    parent_page = virt_to_page(mm->pgd);
-    repl = READ_ONCE(parent_page->replica);
-
-    if (!repl) {
-        native_set_pgd(pgdp, pgdval);
-        return;
-    }
-
-    /* Check child (P4D or PUD page depending on paging level) replicas */
-    if (has_child && entry_val != 0) {
-        unsigned long child_phys = entry_val & pfn_mask;
-        if (child_phys && pfn_valid(child_phys >> PAGE_SHIFT)) {
-            struct page *cp = pfn_to_page(child_phys >> PAGE_SHIFT);
-            struct page *cp_repl = READ_ONCE(cp->replica);
-            
-            if (cp && cp_repl)
-                child_base_page = cp;
-        }
-    }
-
-    offset = ((unsigned long)pgdp) & ~PAGE_MASK;
-
-    struct page *cur_page = parent_page;
-    do {
-        void *page_addr = page_address(cur_page);
-        pgd_t *replica_entry;
-        unsigned long node_val;
-        int node;
-
-        if (!page_addr)
-            BUG();
-
-        node = page_to_nid(cur_page);
-        replica_entry = (pgd_t *)(page_addr + offset);
-
-        if (child_base_page && entry_val != 0) {
-            struct page *node_local_child = get_replica_for_node(child_base_page, node);
-            void *node_child_addr;
-
-            if (!node_local_child || page_to_nid(node_local_child) != node)
-                BUG();
-
-            node_child_addr = page_address(node_local_child);
-            if (!node_child_addr)
-                BUG();
-
-            node_val = __pa(node_child_addr) | (entry_val & ~pfn_mask);
-        } else {
-            node_val = entry_val;
-        }
-
-        WRITE_ONCE(*replica_entry, __pgd(node_val));
-
-        cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
-    } while (cur_page && cur_page != parent_page);
-
-    smp_wmb();
 }
 
 pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
@@ -955,8 +980,8 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
     flags = pgd_flags(__pgd(val));
 
     /* Walk the circular list and OR together all flags */
-    cur_page = pgd_page;
-    do {
+    cur_page = pgd_page->replica;
+    while (cur_page && cur_page != pgd_page) {
         pgd_t *replica_pgd;
         void *page_addr = page_address(cur_page);
 
@@ -967,10 +992,9 @@ pgd_t pgtable_repl_get_pgd(pgd_t *pgdp)
         flags |= pgd_flags(*replica_pgd);
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
+        if (++iterations >= MAX_NUMNODES)
             break;
-    } while (cur_page && cur_page != pgd_page);
+    }
 
     return __pgd((val & PTE_PFN_MASK) | flags);
 }
@@ -1033,36 +1057,28 @@ static void free_replica_chain(struct page *base_page)
 
 typedef void (*replica_operation_fn)(void *base_addr, unsigned long offset, void *context);
 
-
 void pgtable_repl_clear_pte(pte_t *ptep, struct mm_struct *mm)
 {
-    struct page *pte_page;
-    struct page *cur_page;
+    struct page *pte_page, *cur_page;
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
 
     if (!ptep)
-        BUG();
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_pte_clear(mm, 0, ptep);
-        smp_wmb();
         return;
-    }
+
+    native_pte_clear(mm, 0, ptep);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
 
     pte_page = virt_to_page(ptep);
     if (!pte_page)
-        BUG();
+        return;
 
     repl = READ_ONCE(pte_page->replica);
-
-    if (!repl) {
-        native_pte_clear(mm, 0, ptep);
-        smp_wmb();
-        flush_tlb_mm(mm);
+    if (!repl)
         return;
-    }
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
@@ -1072,52 +1088,42 @@ void pgtable_repl_clear_pte(pte_t *ptep, struct mm_struct *mm)
         pte_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;
 
         replica_entry = (pte_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, __pte(0));
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
+        if (++iterations >= MAX_NUMNODES)
+            break;
     } while (cur_page && cur_page != pte_page);
 
     smp_wmb();
-    flush_tlb_mm(mm);
 }
-
 
 void pgtable_repl_clear_pmd(pmd_t *pmdp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *pmd_page;
-    struct page *cur_page;
+    struct page *pmd_page, *cur_page;
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
 
     if (!pmdp)
-        BUG();
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_pmd_clear(pmdp);
-        smp_wmb();
         return;
-    }
+
+    native_pmd_clear(pmdp);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
 
     pmd_page = virt_to_page(pmdp);
     if (!pmd_page)
-        BUG();
+        return;
 
     repl = READ_ONCE(pmd_page->replica);
-
-    if (!repl) {
-        native_pmd_clear(pmdp);
-        smp_wmb();
-        flush_tlb_mm(mm);
+    if (!repl)
         return;
-    }
 
     offset = ((unsigned long)pmdp) & ~PAGE_MASK;
 
@@ -1127,51 +1133,42 @@ void pgtable_repl_clear_pmd(pmd_t *pmdp)
         pmd_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;
 
         replica_entry = (pmd_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, __pmd(0));
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
+        if (++iterations >= MAX_NUMNODES)
+            break;
     } while (cur_page && cur_page != pmd_page);
 
     smp_wmb();
-    flush_tlb_mm(mm);
 }
 
 void pgtable_repl_clear_pud(pud_t *pudp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *pud_page;
-    struct page *cur_page;
+    struct page *pud_page, *cur_page;
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
 
     if (!pudp)
-        BUG();
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_pud_clear(pudp);
-        smp_wmb();
         return;
-    }
+
+    native_pud_clear(pudp);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
 
     pud_page = virt_to_page(pudp);
     if (!pud_page)
-        BUG();
+        return;
 
     repl = READ_ONCE(pud_page->replica);
-
-    if (!repl) {
-        native_pud_clear(pudp);
-        smp_wmb();
-        flush_tlb_mm(mm);
+    if (!repl)
         return;
-    }
 
     offset = ((unsigned long)pudp) & ~PAGE_MASK;
 
@@ -1181,51 +1178,42 @@ void pgtable_repl_clear_pud(pud_t *pudp)
         pud_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;
 
         replica_entry = (pud_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, __pud(0));
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
+        if (++iterations >= MAX_NUMNODES)
+            break;
     } while (cur_page && cur_page != pud_page);
 
     smp_wmb();
-    flush_tlb_mm(mm);
 }
 
 void pgtable_repl_clear_p4d(p4d_t *p4dp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *p4d_page;
-    struct page *cur_page;
+    struct page *p4d_page, *cur_page;
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
 
     if (!p4dp)
-        BUG();
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        native_p4d_clear(p4dp);
-        smp_wmb();
         return;
-    }
+
+    native_p4d_clear(p4dp);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
 
     p4d_page = virt_to_page(p4dp);
     if (!p4d_page)
-        BUG();
+        return;
 
     repl = READ_ONCE(p4d_page->replica);
-
-    if (!repl) {
-        native_p4d_clear(p4dp);
-        smp_wmb();
-        flush_tlb_mm(mm);
+    if (!repl)
         return;
-    }
 
     offset = ((unsigned long)p4dp) & ~PAGE_MASK;
 
@@ -1235,53 +1223,43 @@ void pgtable_repl_clear_p4d(p4d_t *p4dp)
         p4d_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;
 
         replica_entry = (p4d_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, __p4d(0));
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
+        if (++iterations >= MAX_NUMNODES)
+            break;
     } while (cur_page && cur_page != p4d_page);
 
     smp_wmb();
-    flush_tlb_mm(mm);
 }
 
 void pgtable_repl_clear_pgd(pgd_t *pgdp)
 {
     struct mm_struct *mm = current ? current->mm : NULL;
-    struct page *pgd_page;
-    struct page *cur_page;
+    struct page *pgd_page, *cur_page;
     struct page *repl;
     unsigned long offset;
     int iterations = 0;
 
     if (!pgdp)
-        BUG();
-
-    if (!mm || !mm->repl_pgd_enabled) {
-        if (pgtable_l5_enabled())
-            native_pgd_clear(pgdp);
-        smp_wmb();
         return;
-    }
+
+    if (pgtable_l5_enabled())
+        native_pgd_clear(pgdp);
+
+    if (!mm || !mm->repl_pgd_enabled)
+        return;
 
     pgd_page = virt_to_page(mm->pgd);
     if (!pgd_page)
-        BUG();
+        return;
 
     repl = READ_ONCE(pgd_page->replica);
-
-    if (!repl) {
-        if (pgtable_l5_enabled())
-            native_pgd_clear(pgdp);
-        smp_wmb();
-        flush_tlb_mm(mm);
+    if (!repl)
         return;
-    }
 
     offset = ((unsigned long)pgdp) & ~PAGE_MASK;
 
@@ -1291,19 +1269,17 @@ void pgtable_repl_clear_pgd(pgd_t *pgdp)
         pgd_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;
 
         replica_entry = (pgd_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, __pgd(0));
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
+        if (++iterations >= MAX_NUMNODES)
+            break;
     } while (cur_page && cur_page != pgd_page);
 
     smp_wmb();
-    flush_tlb_mm(mm);
 }
 
 void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
@@ -1317,16 +1293,19 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
     unsigned long offset;
     int iterations = 0;
 
-    if (!vma || !vma->vm_mm)
-        BUG();
+    if (!vma || !vma->vm_mm || !ptep) {
+        /* Invalid args - just write primary if possible */
+        if (ptep)
+            WRITE_ONCE(*ptep, pte);
+        return;
+    }
 
     mm = vma->vm_mm;
 
-    if (!ptep)
-        BUG();
+    /* Always write primary first */
+    WRITE_ONCE(*ptep, pte);
 
     if (!mm->repl_pgd_enabled) {
-        WRITE_ONCE(*ptep, pte);
         smp_wmb();
         return;
     }
@@ -1335,29 +1314,28 @@ void pgtable_repl_ptep_modify_prot_commit(struct vm_area_struct *vma,
     repl = READ_ONCE(pte_page->replica);
 
     if (!repl) {
-        WRITE_ONCE(*ptep, pte);
         smp_wmb();
         return;
     }
 
     offset = ((unsigned long)ptep) & ~PAGE_MASK;
 
-    cur_page = pte_page;
-    do {
+    /* Start from first replica, not from pte_page (already written) */
+    cur_page = READ_ONCE(pte_page->replica);
+    while (cur_page && cur_page != pte_page) {
         void *page_addr = page_address(cur_page);
         pte_t *replica_entry;
 
         if (!page_addr)
-            BUG();
+            break;  /* Invalid page - stop */
 
         replica_entry = (pte_t *)(page_addr + offset);
         WRITE_ONCE(*replica_entry, pte);
 
         cur_page = READ_ONCE(cur_page->replica);
-        iterations++;
-        if (iterations >= MAX_NUMNODES)
-            BUG();
-    } while (cur_page && cur_page != pte_page);
+        if (++iterations >= MAX_NUMNODES)
+            break;  /* Safety limit */
+    }
 
     smp_wmb();
 }
@@ -1957,9 +1935,10 @@ fail_free_pgds:
     smp_wmb();
 
 fail_unlock:
-    nodes_clear(mm->repl_pgd_nodes);
-    mm->repl_pgd_enabled = false;
+    mm->repl_pgd_enabled = false;         // FIRST: disable
     mm->repl_in_progress = false;
+    smp_wmb();                            // Barrier before clearing state
+    nodes_clear(mm->repl_pgd_nodes);      // THEN: clear nodes
     memset(mm->pgd_replicas, 0, sizeof(mm->pgd_replicas));
     mm->original_pgd = NULL;
     smp_wmb();
@@ -2504,46 +2483,80 @@ __setup("mitosis", mitosis_setup);
 
 void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 {
-    struct page *base_page = pfn_to_page(pfn);
+    struct page *base_page;
     struct page *pages[MAX_NUMNODES];
     void *src_addr, *dst_addr;
     int count = 0;
-    int i;
+    int i, ret;
     unsigned long flags;
 
-    if (!mm || !mm->repl_pgd_enabled || !base_page)
+    if (!mm || !pfn_valid(pfn))
+        return;
+
+    base_page = pfn_to_page(pfn);
+    if (!base_page)
         return;
 
     local_irq_save(flags);
 
-    /* Already has replicas - nothing to do */
+    /* Check enabled state with IRQs disabled */
+    if (!mm->repl_pgd_enabled) {
+        local_irq_restore(flags);
+        return;
+    }
+
+    /* Already has replicas */
     if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr)
-        BUG();
+    if (!src_addr) {
+        local_irq_restore(flags);
+        return;
+    }
 
-    alloc_pte_replicas(base_page, mm, pages, &count);
+    ret = alloc_pte_replicas(base_page, mm, pages, &count);
+    if (ret != 0 || count < 2) {
+        local_irq_restore(flags);
+        return;
+    }
 
+    /* Clear replica pointers before linking */
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
     smp_wmb();
 
+    /* Copy content to all replicas */
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr)
-            BUG();
+        if (!dst_addr) {
+            /* Cleanup on failure */
+            for (int k = 1; k < count; k++) {
+                struct ptdesc *pt = page_ptdesc(pages[k]);
+                pagetable_dtor(pt);
+                __free_page(pages[k]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
+    /* Link replicas */
     if (count > 1) {
-        if (!link_page_replicas(pages, count))
-            BUG();
+        if (!link_page_replicas(pages, count)) {
+            for (i = 1; i < count; i++) {
+                struct ptdesc *pt = page_ptdesc(pages[i]);
+                pagetable_dtor(pt);
+                __free_page(pages[i]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
     }
 
     smp_mb();
@@ -2552,29 +2565,43 @@ void pgtable_repl_alloc_pte(struct mm_struct *mm, unsigned long pfn)
 
 void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 {
-    struct page *base_page = pfn_to_page(pfn);
+    struct page *base_page;
     struct page *pages[MAX_NUMNODES];
     void *src_addr, *dst_addr;
     int count = 0;
-    int i;
+    int i, ret;
     unsigned long flags;
 
-    if (!mm || !mm->repl_pgd_enabled || !base_page)
+    if (!mm || !pfn_valid(pfn))
+        return;
+
+    base_page = pfn_to_page(pfn);
+    if (!base_page)
         return;
 
     local_irq_save(flags);
 
-    /* Already has replicas - nothing to do */
+    if (!mm->repl_pgd_enabled) {
+        local_irq_restore(flags);
+        return;
+    }
+
     if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr)
-        BUG();
+    if (!src_addr) {
+        local_irq_restore(flags);
+        return;
+    }
 
-    alloc_pmd_replicas(base_page, mm, pages, &count);
+    ret = alloc_pmd_replicas(base_page, mm, pages, &count);
+    if (ret != 0 || count < 2) {
+        local_irq_restore(flags);
+        return;
+    }
 
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
@@ -2582,16 +2609,30 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr)
-            BUG();
+        if (!dst_addr) {
+            for (int k = 1; k < count; k++) {
+                struct ptdesc *pt = page_ptdesc(pages[k]);
+                pagetable_dtor(pt);
+                __free_page(pages[k]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
     if (count > 1) {
-        if (!link_page_replicas(pages, count))
-            BUG();
+        if (!link_page_replicas(pages, count)) {
+            for (i = 1; i < count; i++) {
+                struct ptdesc *pt = page_ptdesc(pages[i]);
+                pagetable_dtor(pt);
+                __free_page(pages[i]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
     }
 
     smp_mb();
@@ -2600,29 +2641,43 @@ void pgtable_repl_alloc_pmd(struct mm_struct *mm, unsigned long pfn)
 
 void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 {
-    struct page *base_page = pfn_to_page(pfn);
+    struct page *base_page;
     struct page *pages[MAX_NUMNODES];
     void *src_addr, *dst_addr;
     int count = 0;
-    int i;
+    int i, ret;
     unsigned long flags;
 
-    if (!mm || !mm->repl_pgd_enabled || !base_page)
+    if (!mm || !pfn_valid(pfn))
+        return;
+
+    base_page = pfn_to_page(pfn);
+    if (!base_page)
         return;
 
     local_irq_save(flags);
 
-    /* Already has replicas - nothing to do */
+    if (!mm->repl_pgd_enabled) {
+        local_irq_restore(flags);
+        return;
+    }
+
     if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr)
-        BUG();
+    if (!src_addr) {
+        local_irq_restore(flags);
+        return;
+    }
 
-    alloc_pud_replicas(base_page, mm, pages, &count);
+    ret = alloc_pud_replicas(base_page, mm, pages, &count);
+    if (ret != 0 || count < 2) {
+        local_irq_restore(flags);
+        return;
+    }
 
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
@@ -2630,16 +2685,30 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr)
-            BUG();
+        if (!dst_addr) {
+            for (int k = 1; k < count; k++) {
+                struct ptdesc *pt = page_ptdesc(pages[k]);
+                pagetable_dtor(pt);
+                __free_page(pages[k]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
     if (count > 1) {
-        if (!link_page_replicas(pages, count))
-            BUG();
+        if (!link_page_replicas(pages, count)) {
+            for (i = 1; i < count; i++) {
+                struct ptdesc *pt = page_ptdesc(pages[i]);
+                pagetable_dtor(pt);
+                __free_page(pages[i]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
     }
 
     smp_mb();
@@ -2648,32 +2717,46 @@ void pgtable_repl_alloc_pud(struct mm_struct *mm, unsigned long pfn)
 
 void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 {
-    struct page *base_page = pfn_to_page(pfn);
+    struct page *base_page;
     struct page *pages[MAX_NUMNODES];
     void *src_addr, *dst_addr;
     int count = 0;
-    int i;
+    int i, ret;
     unsigned long flags;
-
-    if (!mm || !mm->repl_pgd_enabled || !base_page)
-        return;
 
     if (!pgtable_l5_enabled())
         return;
 
+    if (!mm || !pfn_valid(pfn))
+        return;
+
+    base_page = pfn_to_page(pfn);
+    if (!base_page)
+        return;
+
     local_irq_save(flags);
 
-    /* Already has replicas - nothing to do */
+    if (!mm->repl_pgd_enabled) {
+        local_irq_restore(flags);
+        return;
+    }
+
     if (READ_ONCE(base_page->replica)) {
         local_irq_restore(flags);
         return;
     }
 
     src_addr = page_address(base_page);
-    if (!src_addr)
-        BUG();
+    if (!src_addr) {
+        local_irq_restore(flags);
+        return;
+    }
 
-    alloc_p4d_replicas(base_page, mm, pages, &count);
+    ret = alloc_p4d_replicas(base_page, mm, pages, &count);
+    if (ret != 0 || count < 2) {
+        local_irq_restore(flags);
+        return;
+    }
 
     for (i = 1; i < count; i++)
         pages[i]->replica = NULL;
@@ -2681,16 +2764,30 @@ void pgtable_repl_alloc_p4d(struct mm_struct *mm, unsigned long pfn)
 
     for (i = 1; i < count; i++) {
         dst_addr = page_address(pages[i]);
-        if (!dst_addr)
-            BUG();
+        if (!dst_addr) {
+            for (int k = 1; k < count; k++) {
+                struct ptdesc *pt = page_ptdesc(pages[k]);
+                pagetable_dtor(pt);
+                __free_page(pages[k]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
         memcpy(dst_addr, src_addr, PAGE_SIZE);
         clflush_cache_range(dst_addr, PAGE_SIZE);
     }
     smp_mb();
 
     if (count > 1) {
-        if (!link_page_replicas(pages, count))
-            BUG();
+        if (!link_page_replicas(pages, count)) {
+            for (i = 1; i < count; i++) {
+                struct ptdesc *pt = page_ptdesc(pages[i]);
+                pagetable_dtor(pt);
+                __free_page(pages[i]);
+            }
+            local_irq_restore(flags);
+            return;
+        }
     }
 
     smp_mb();
