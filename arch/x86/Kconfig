@@ -1565,15 +1565,18 @@ config X86_64_ACPI_NUMA
 	select ACPI_NUMA
 	help
 	  Enable ACPI SRAT based node topology detection.
+	  
 config PGTABLE_REPLICATION
 	bool "Page table replication support"
 	depends on X86_64 && NUMA && SMP && PARAVIRT_XXL
+	depends on !MITIGATION_PAGE_TABLE_ISOLATION
 	default n
 	help
 	  Enable replication of page tables across NUMA nodes.
-	  This feature replicates the Page Global Directory (PGD) 
-	  across NUMA nodes to reduce remote memory accesses during
-	  page table walks.
+	  
+	  Note: This feature is incompatible with Page Table Isolation
+	  (PTI/KPTI Meltdown mitigation). Systems with CPUs vulnerable
+	  to Meltdown should not use this feature.
 	  
 	  If unsure, say N.
 config NODES_SHIFT
@@ -2478,8 +2481,7 @@ config PREFIX_SYMBOLS
 
 menuconfig CPU_MITIGATIONS
 	bool "Mitigations for CPU vulnerabilities"
-	default n
-	depends on BROKEN
+	default y
 	help
 	  Say Y here to enable options which enable mitigations for hardware
 	  vulnerabilities (usually related to speculative execution).
